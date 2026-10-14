@@ -1,0 +1,7 @@
+votera.db
+credentials.csv
+__pycache__/
+*.pyc
+*.apk
+.env
+venv/
