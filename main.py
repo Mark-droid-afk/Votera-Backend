@@ -639,9 +639,27 @@ async def _autoclose_loop():
             pass
 
 
+def _apply_admin_password():
+    """If VOTERA_ADMIN_PASSWORD is set, the administrator account uses that password (applied on every start,
+    so it can be changed from the hosting dashboard without re-seeding). The password never appears in code."""
+    pw = os.getenv("VOTERA_ADMIN_PASSWORD")
+    if not pw:
+        return
+    db = SessionLocal()
+    try:
+        admin = db.scalar(select(User).where(User.role == "admin").order_by(User.id))
+        if admin and not verify_password(pw, admin.password_hash):
+            admin.password_hash = hash_password(pw)
+            db.commit()
+            audit(db, "system", "", "admin_password", "Administrator password updated from the server settings")
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 async def _capture_loop():
     global _autoclose_task
+    await asyncio.to_thread(_apply_admin_password)
     manager.loop = asyncio.get_running_loop()
     _autoclose_task = asyncio.create_task(_autoclose_loop())
 
