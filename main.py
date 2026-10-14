@@ -25,8 +25,12 @@ import scoring
 SECRET_KEY = os.getenv("VOTERA_SECRET_KEY", "dev-secret-change-me-use-a-long-random-value")
 TX_SALT = os.getenv("VOTERA_TX_SALT", "dev-tx-salt-change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./votera.db")
+if DATABASE_URL.startswith("postgres://"):  # some hosts hand out the short form; SQLAlchemy wants postgresql://
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+if DATABASE_URL.startswith("postgresql://"):  # newer SQLAlchemy defaults to the psycopg3 driver; this project installs psycopg2
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgresql://"):]
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine, autoflush=False)
 
 

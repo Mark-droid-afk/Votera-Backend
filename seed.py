@@ -41,6 +41,12 @@ def avatar_jpeg(bg, fg):
 AVATAR_COLORS = [((114, 9, 39), (235, 200, 210)), ((31, 111, 139), (205, 230, 238)), ((76, 122, 52), (214, 232, 204)),
                  ((106, 76, 147), (225, 214, 238)), ((193, 68, 14), (246, 214, 198))]
 
+import sys
+if "--if-empty" in sys.argv:  # used by the hosted start command: seed only the first time, never wipe real votes
+    with SessionLocal() as _db:
+        if _db.query(User).count() > 0:
+            print("Database already has data. Skipping seed.")
+            sys.exit(0)
 Base.metadata.drop_all(engine)
 Base.metadata.create_all(engine)
 db = SessionLocal()
@@ -64,7 +70,7 @@ names = fictional_names(len(programs_for_accounts))
 for i, prog in enumerate(programs_for_accounts, start=1):
     sn = f"2022-{90000 + i:05d}-CM-0"
     pw = secrets.token_urlsafe(6) if UNIQUE else "student123"
-    db.add(User(student_number=sn, full_name=names[i - 1], program=prog,
+    db.add(User(student_number=sn, full_name=names[i - 1], program=prog, respondent_code=f"R-{i:03d}",
                 password_hash=hash_password(pw) if UNIQUE else shared_hash,
                 role="student", otp_secret=secrets.token_hex(10)))
     creds.append((sn, names[i - 1], prog, pw))

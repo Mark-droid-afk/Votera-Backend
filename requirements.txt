@@ -6,3 +6,4 @@ pyjwt
 scikit-learn
 httpx
 pillow
+psycopg2-binary
