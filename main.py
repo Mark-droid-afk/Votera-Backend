@@ -11,6 +11,7 @@ import bcrypt
 import jwt
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, select, func, String, Integer, Boolean, Float, Text, LargeBinary,
@@ -408,6 +409,7 @@ def _candidate_base(c: Candidate) -> dict:
 
 # ---------------- Application layer ----------------
 app = FastAPI(title="Votera API (prototype)")
+app.add_middleware(GZipMiddleware, minimum_size=600)  # smaller responses over mobile data (candidate texts, voter lists)
 
 
 @app.post("/auth/login")
@@ -671,7 +673,15 @@ async def _stop_loop():
 
 
 @app.get("/health")
-def health(db: Session = Depends(get_db)):
+def health():
+    """Light check with no database call. Used by the uptime monitor, so an idle database can stay asleep."""
+    return {"status": "ok", "election": None}
+
+
+@app.get("/health/db")
+def health_db(db: Session = Depends(get_db)):
+    """Full check including the database. The app calls it once at start so the server and database wake up
+    while the student is still typing the login."""
     e = db.scalar(select(Election).order_by(Election.id))
     return {"status": "ok", "election": e.status if e else None}
 
