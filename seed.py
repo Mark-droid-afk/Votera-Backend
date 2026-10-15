@@ -86,26 +86,39 @@ db.flush()
 # Fictional candidates. Miguel and Carla are deliberately near-identical so the originality check flags them.
 # Last three numbers = administrator-entered scores (achievements, leadership, community), 0-100, fictional.
 cands = [
-    ("Ana Reyes", "BSIT", "I will make student services faster and easier by bringing enrollment concerns, scholarship updates, and clearance steps into one clear online guide. I will also open a mental health desk with trained peer listeners and partner with the guidance office for regular wellness weeks.",
+    ("President", "Ana Reyes", "BSIT", "I will make student services faster and easier by bringing enrollment concerns, scholarship updates, and clearance steps into one clear online guide. I will also open a mental health desk with trained peer listeners and partner with the guidance office for regular wellness weeks.",
      "Dean's Lister, three semesters. Hackathon finalist, 2025.", "Class president, 2nd year. Org vice president, 3rd year.", "Led a donation drive for flood-affected families.", (90, 85, 80)),
-    ("Miguel Santos", "BSBA - HRM", "I will push for a student council that listens first and acts fast. My platform focuses on free tutoring programs, a transparent budget report every month, and stronger support for student organizations across all programs. Every student deserves a voice, and I will make sure every concern reaches the administration.",
+    ("President", "Miguel Santos", "BSBA - HRM", "I will push for a student council that listens first and acts fast. My platform focuses on free tutoring programs, a transparent budget report every month, and stronger support for student organizations across all programs. Every student deserves a voice, and I will make sure every concern reaches the administration.",
      "Best Thesis Proposal, department level.", "Org treasurer, 3rd year. Class secretary, 2nd year.", "Volunteer in a campus tree-planting activity.", (70, 75, 60)),
-    ("Carla Mendoza", "BSBA - MM", "I will push for a student council that listens first and acts quickly. My platform focuses on free tutoring programs, a transparent budget report every month, and stronger support for student organizations across all programs. Every student deserves a voice, and I will make sure each concern reaches the administration.",
+    ("Vice President", "Carla Mendoza", "BSBA - MM", "I will push for a student council that listens first and acts quickly. My platform focuses on free tutoring programs, a transparent budget report every month, and stronger support for student organizations across all programs. Every student deserves a voice, and I will make sure each concern reaches the administration.",
      "Marketing case competition participant.", "Class representative, 3rd year.", "Joined a literacy outreach program.", (60, 65, 70)),
-    ("Paolo Villanueva", "BS Entrepreneurship", "My focus is campus life outside the classroom. I will organize quarterly sports fests and cultural nights, create a job fair with partner companies for graduating students, and set up a small business bazaar where student entrepreneurs can sell on campus at no cost.",
+    ("Vice President", "Paolo Villanueva", "BS Entrepreneurship", "My focus is campus life outside the classroom. I will organize quarterly sports fests and cultural nights, create a job fair with partner companies for graduating students, and set up a small business bazaar where student entrepreneurs can sell on campus at no cost.",
      "Startup pitch competition, second place.", "Org president, 3rd and 4th year.", "Organized a livelihood training for a nearby community.", (75, 90, 85)),
-    ("Liza Navarro", "BTLEd - ICT", "I will work with the administration on safer walkways, better lighting, working restrooms, and accessible ramps and elevators for students with mobility needs. I will also press for fair canteen prices and a monthly open forum where students can question the council directly.",
+    ("Secretary-General", "Liza Navarro", "BTLEd - ICT", "I will work with the administration on safer walkways, better lighting, working restrooms, and accessible ramps and elevators for students with mobility needs. I will also press for fair canteen prices and a monthly open forum where students can question the council directly.",
      "Academic excellence award, 2nd year.", "Peer tutor coordinator. Class vice president, 3rd year.", "Regular blood donation drive volunteer.", (85, 80, 90)),
+    ("Secretary-General", "Jose Ramos", "BPA - Fiscal Administration",
+     "Council records should be easy for any student to read. I will post short minutes within two days of every meeting, keep one public calendar of council activities, and set up a suggestion box that is answered in writing every week.",
+     "Best in Public Speaking, 2nd year.", "Org secretary, 3rd year.", "Helped organize a school supplies giveaway.", (65, 70, 65)),
+    ("Treasurer", "Maria Cruz", "DOMT - Medical Office Management",
+     "Every peso of council funds should have a receipt a student can see. I will publish a simple income and spending sheet each month, ask students to vote on how leftover funds are used, and cut costs on events by asking partner shops for discounts.",
+     "Scholar with high honors, 2nd and 3rd year.", "Org auditor, 3rd year.", "Joined a community health outreach.", (80, 70, 75)),
+    ("Treasurer", "Noel Bautista", "BTLEd - Home Economics",
+     "I want a council that runs on fundraising, not on student fees. My plan is a cooking and baking sale each term, a recycling drive that turns used paper into funds, and a clear signboard that shows what each activity earned and what it cost.",
+     "Home economics skills competition, regional participant.", "Class treasurer, 2nd and 3rd year.", "Fed families during a relief operation.", (70, 65, 80)),
 ]
-for k, (name, prog, manifesto, ach, lead, comm, (sa, sl, sc)) in enumerate(cands):
+for k, (position, name, prog, manifesto, ach, lead, comm, (sa, sl, sc)) in enumerate(cands):
     photo = avatar_jpeg(*AVATAR_COLORS[k % len(AVATAR_COLORS)])
-    db.add(Candidate(election_id=e.id, full_name=name, program=prog, position="SSC President",
+    db.add(Candidate(election_id=e.id, full_name=name, program=prog, position=position,
                      manifesto=manifesto, achievements=ach, leadership=lead, community=comm,
                      achievements_score=sa, leadership_score=sl, community_score=sc,
                      photo=photo, photo_type="image/jpeg" if photo else None, photo_version=1 if photo else 0))
 
-db.add(Announcement(election_id=e.id, title="Voting is now open", body="Log in with your student number, password, and OTP to cast your vote."))
-db.add(Announcement(election_id=e.id, title="Review the candidates first", body="Open each candidate profile and compare platforms before voting."))
+db.add(Announcement(election_id=e.id, title="Voting is now open", category="Schedule", pinned=True,
+                    body="Log in with your student number, password, and OTP to cast your vote. You vote once for each position: President, Vice President, Secretary-General and Treasurer."))
+db.add(Announcement(election_id=e.id, title="Review the candidates first", category="Reminder",
+                    body="Open each candidate profile and compare platforms before voting."))
+db.add(Announcement(election_id=e.id, title="How voting works", category="Rules",
+                    body="One vote per position. Your vote cannot be changed after it is recorded, and you get a transaction ID for each one."))
 db.commit()
 
 # Run the credibility checker so every candidate already has similarity, originality, and credibility scores.

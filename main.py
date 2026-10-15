@@ -96,10 +96,12 @@ class Candidate(Base):
 
 class Vote(Base):
     __tablename__ = "votes"
-    __table_args__ = (UniqueConstraint("election_id", "student_number", name="one_student_one_vote"),)
+    # One vote per student per position (President, Vice President, Secretary, ...), not one vote in total.
+    __table_args__ = (UniqueConstraint("election_id", "student_number", "position", name="one_vote_per_position"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     election_id: Mapped[int] = mapped_column(ForeignKey("elections.id"))
     candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"))
+    position: Mapped[str | None] = mapped_column(String(80), nullable=True)
     student_number: Mapped[str] = mapped_column(String(32))
     transaction_id: Mapped[str] = mapped_column(String(64), unique=True)
     cast_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -112,6 +114,11 @@ class Announcement(Base):
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    category: Mapped[str | None] = mapped_column(String(30), nullable=True, default="General")
+    pinned: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=False)
+    image: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)  # optional picture on the post
+    image_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    image_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
 
 
 class AuditLog(Base):
@@ -147,6 +154,22 @@ def ensure_columns():
 ensure_columns()
 
 
+def migrate_votes():
+    """Older databases allowed one vote per student in total. Moves them to one vote per student per position
+    (existing votes keep their candidate's position), without losing any votes."""
+    insp = sa_inspect(engine)
+    if not insp.has_table("votes"):
+        return
+    with engine.begin() as conn:
+        conn.execute(sql_text("UPDATE votes SET position = (SELECT position FROM candidates WHERE candidates.id = votes.candidate_id) WHERE position IS NULL"))
+        if engine.dialect.name == "postgresql":
+            conn.execute(sql_text("ALTER TABLE votes DROP CONSTRAINT IF EXISTS one_student_one_vote"))
+        conn.execute(sql_text("CREATE UNIQUE INDEX IF NOT EXISTS one_vote_per_position_idx ON votes (election_id, student_number, position)"))
+
+
+migrate_votes()
+
+
 # ---------------- Security helpers ----------------
 PROGRAMS = ["BSIT", "BTLEd - Home Economics", "BTLEd - ICT", "BSBA - HRM", "BSBA - MM",
             "BS Entrepreneurship", "BPA - Fiscal Administration", "DOMT - Medical Office Management"]
@@ -175,10 +198,59 @@ def make_token(user: User, scope: str, minutes: int) -> str:
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 
-def transaction_id(student_number: str, election_id: int) -> str:
-    """SHA-256 transaction ID tied to the student number. Deterministic per student and
-    election, so a second vote by the same student produces the same ID and is rejected."""
-    return hashlib.sha256(f"{TX_SALT}|{student_number}|{election_id}".encode()).hexdigest()
+def norm_pos(p: str | None) -> str:
+    """Position text with extra spaces removed, for example "  Vice   President " -> "Vice President"."""
+    return " ".join((p or "").split())
+
+
+def pos_key(p: str | None) -> str:
+    return norm_pos(p).casefold()
+
+
+# The PUPQC Student Council positions, in ballot order. Anything else the administrator types is a custom position and is listed after these.
+SSC_POSITIONS = ["President", "Vice President", "Secretary-General", "Treasurer", "Auditor",
+                 "Publicity and Communications Councilor (PCC)", "Creatives and Media Councilor (CMC)",
+                 "Students' Rights and Welfare Councilor (STRAWC)", "Academics and Research Councilor (ARC)",
+                 "Gender and Development Councilor (GADC)", "External Affairs and Partnership Councilor (EAPC)",
+                 "Logistics and Technical Councilor (LTC)"]
+_POS_ALIASES = {"ssc president": 0, "secretary": 2, "secretary general": 2, "pcc": 5, "cmc": 6, "strawc": 7, "arc": 8,
+                "gadc": 9, "eapc": 10, "ltc": 11}
+
+
+def position_rank(p: str) -> tuple[int, str]:
+    """Position order on the ballot: the standard SSC list first, then custom positions A to Z."""
+    k = pos_key(p)
+    for i, n in enumerate(SSC_POSITIONS):
+        if k == n.casefold():
+            return (i, k)
+    if k in _POS_ALIASES:
+        return (_POS_ALIASES[k], k)
+    if "vice" in k and "president" in k:
+        return (1, k)
+    if "president" in k:
+        return (0, k)
+    if "treasurer" in k:
+        return (3, k)
+    if "auditor" in k:
+        return (4, k)
+    return (100, k)
+
+
+def position_groups(cands: list) -> list[tuple[str, list]]:
+    """Candidates grouped by position, in display order. Returns [(position name, [candidates])]."""
+    groups: dict[str, tuple[str, list]] = {}
+    for c in sorted(cands, key=lambda x: x.id):
+        k = pos_key(c.position) or "candidate"
+        groups.setdefault(k, (norm_pos(c.position) or "Candidate", []))[1].append(c)
+    return sorted(groups.values(), key=lambda g: position_rank(g[0]))
+
+
+def transaction_id(student_number: str, election_id: int, position: str = "") -> str:
+    """SHA-256 transaction ID tied to the student number, the election and the position. Deterministic, so a
+    second vote by the same student for the same position produces the same ID and is rejected."""
+    base = f"{TX_SALT}|{student_number}|{election_id}"
+    k = pos_key(position)
+    return hashlib.sha256((base + (f"|{k}" if k else "")).encode()).hexdigest()
 
 
 # ---------------- Credibility checker (uses scoring.py) ----------------
@@ -364,15 +436,27 @@ class StatusIn(BaseModel):
     status: str
 
 
+ANNOUNCEMENT_CATEGORIES = ["General", "Schedule", "Reminder", "Rules", "Results", "Urgent"]
+
+
 class AnnouncementIn(BaseModel):
-    title: str
-    body: str = ""
+    title: str = Field(min_length=1, max_length=120)
+    body: str = Field(default="", max_length=1000)
+    category: str = "General"
+    pinned: bool = False
+
+
+class AnnouncementEdit(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    body: str | None = Field(default=None, max_length=1000)
+    category: str | None = None
+    pinned: bool | None = None
 
 
 class CandidateIn(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
     program: str = ""
-    position: str = "SSC President"
+    position: str = Field(default="President", max_length=80)
     manifesto: str = ""
     achievements: str = ""
     leadership: str = ""
@@ -544,77 +628,200 @@ def flagged_manifestos(admin: User = Depends(require_role("admin")), db: Session
 
 
 # ----- Announcements -----
+def _category(c: str | None) -> str:
+    for k in ANNOUNCEMENT_CATEGORIES:
+        if (c or "").strip().casefold() == k.casefold():
+            return k
+    return "General"
+
+
+def announcement_out(a: Announcement) -> dict:
+    return {"id": a.id, "title": a.title, "body": a.body, "created_at": a.created_at.isoformat(),
+            "category": a.category or "General", "pinned": bool(a.pinned), "image_version": a.image_version or 0}
+
+
 @app.get("/announcements")
 def list_announcements(user: User = Depends(current_user), db: Session = Depends(get_db)):
     e = get_election(db)
     rows = db.scalars(select(Announcement).where(Announcement.election_id == e.id)
-                      .order_by(Announcement.created_at.desc())).all()
-    return [{"id": a.id, "title": a.title, "body": a.body, "created_at": a.created_at.isoformat()} for a in rows]
+                      .order_by(func.coalesce(Announcement.pinned, False).desc(), Announcement.created_at.desc())).all()
+    return [announcement_out(a) for a in rows]
 
 
 @app.post("/announcements")
 def create_announcement(body: AnnouncementIn, admin: User = Depends(require_role("admin")),
                         db: Session = Depends(get_db)):
     e = get_election(db)
-    a = Announcement(election_id=e.id, title=body.title, body=body.body)
+    a = Announcement(election_id=e.id, title=body.title.strip(), body=body.body.strip(), category=_category(body.category),
+                     pinned=body.pinned, image_version=0)
     db.add(a)
     db.commit()
     audit(db, admin.student_number, "admin", "announcement", a.title)
     notify("announcements")
-    return {"id": a.id, "title": a.title, "body": a.body, "created_at": a.created_at.isoformat()}
+    return announcement_out(a)
+
+
+@app.put("/admin/announcements/{announcement_id}")
+def edit_announcement(announcement_id: int, body: AnnouncementEdit, admin: User = Depends(require_role("admin")),
+                      db: Session = Depends(get_db)):
+    a = db.get(Announcement, announcement_id)
+    if not a:
+        raise HTTPException(404, "Announcement not found")
+    if body.title is not None:
+        a.title = body.title.strip()
+    if body.body is not None:
+        a.body = body.body.strip()
+    if body.category is not None:
+        a.category = _category(body.category)
+    if body.pinned is not None:
+        a.pinned = body.pinned
+    db.commit()
+    audit(db, admin.student_number, "admin", "announcement_edit", a.title)
+    notify("announcements")
+    return announcement_out(a)
+
+
+@app.delete("/admin/announcements/{announcement_id}")
+def delete_announcement(announcement_id: int, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    a = db.get(Announcement, announcement_id)
+    if not a:
+        raise HTTPException(404, "Announcement not found")
+    title = a.title
+    db.delete(a)
+    db.commit()
+    audit(db, admin.student_number, "admin", "announcement_delete", title)
+    notify("announcements")
+    return {"deleted": announcement_id}
+
+
+@app.get("/announcements/{announcement_id}/image")
+def get_announcement_image(announcement_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    a = db.get(Announcement, announcement_id)
+    if not a or not a.image:
+        raise HTTPException(404, "No image")
+    return Response(a.image, media_type=a.image_type or "image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.put("/admin/announcements/{announcement_id}/image")
+async def put_announcement_image(announcement_id: int, request: Request, admin: User = Depends(require_role("admin")),
+                                 db: Session = Depends(get_db)):
+    """Body is the raw image bytes (JPEG or PNG, up to 2 MB). The app shrinks pictures before sending."""
+    data = await request.body()
+    if len(data) > 2_000_000:
+        raise HTTPException(413, "Image is too large (max 2 MB)")
+    if data[:3] == b"\xff\xd8\xff":
+        kind = "image/jpeg"
+    elif data[:8] == b"\x89PNG\r\n\x1a\n":
+        kind = "image/png"
+    else:
+        raise HTTPException(415, "Use a JPEG or PNG image")
+    a = db.get(Announcement, announcement_id)
+    if not a:
+        raise HTTPException(404, "Announcement not found")
+    a.image, a.image_type, a.image_version = data, kind, (a.image_version or 0) + 1
+    db.commit()
+    notify("announcements")
+    return announcement_out(a)
+
+
+@app.delete("/admin/announcements/{announcement_id}/image")
+def delete_announcement_image(announcement_id: int, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    a = db.get(Announcement, announcement_id)
+    if not a:
+        raise HTTPException(404, "Announcement not found")
+    a.image, a.image_type, a.image_version = None, None, (a.image_version or 0) + 1
+    db.commit()
+    notify("announcements")
+    return announcement_out(a)
+
+
+@app.get("/announcement-categories")
+def announcement_categories(user: User = Depends(current_user)):
+    return ANNOUNCEMENT_CATEGORIES
 
 
 # ----- Voting -----
+def _own_votes(db: Session, e: Election, student_number: str) -> dict[str, Vote]:
+    return {pos_key(v.position): v for v in db.scalars(
+        select(Vote).where(Vote.election_id == e.id, Vote.student_number == student_number).order_by(Vote.cast_at))}
+
+
 @app.get("/vote/status")
 def vote_status(student: User = Depends(require_role("student")), db: Session = Depends(get_db)):
+    """Which positions this student has voted for and which are still open. Only the student's own choices."""
     e = get_election(db)
-    v = db.scalar(select(Vote).where(Vote.election_id == e.id, Vote.student_number == student.student_number))
-    return {"has_voted": v is not None, "transaction_id": v.transaction_id if v else None}
+    cands = db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all()
+    names = {c.id: c.full_name for c in cands}
+    mine = _own_votes(db, e, student.student_number)
+    positions = []
+    for name, group in position_groups(cands):
+        v = mine.get(pos_key(name))
+        positions.append({"position": name, "voted": v is not None, "candidate_id": v.candidate_id if v else None,
+                          "candidate_name": names.get(v.candidate_id) if v else None,
+                          "transaction_id": v.transaction_id if v else None,
+                          "voted_at": v.cast_at.isoformat() if v else None})
+    last = max(mine.values(), key=lambda v: v.cast_at) if mine else None
+    return {"has_voted": bool(mine), "complete": bool(positions) and all(p["voted"] for p in positions),
+            "transaction_id": last.transaction_id if last else None, "positions": positions}
 
 
 @app.post("/vote")
 def cast_vote(body: VoteIn, student: User = Depends(require_role("student")), db: Session = Depends(get_db)):
-    """One-student-one-vote via Transaction ID Verification."""
+    """One vote per student per position, each with its own SHA-256 Transaction ID."""
     e = get_election(db)
     if e.status != "open":
         raise HTTPException(403, f"Voting is not open (status: {e.status})")
     c = db.get(Candidate, body.candidate_id)
     if not c or c.election_id != e.id:
         raise HTTPException(404, "Candidate not found in this election")
-    tx = transaction_id(student.student_number, e.id)
+    position = norm_pos(c.position) or "Candidate"
+    mine = _own_votes(db, e, student.student_number)
+    if pos_key(position) in mine:
+        raise HTTPException(409, f"You have already voted for {position}")
+    tx = transaction_id(student.student_number, e.id, position)
     if db.scalar(select(Vote).where(Vote.transaction_id == tx)):
-        raise HTTPException(409, "You have already voted")
+        raise HTTPException(409, f"You have already voted for {position}")
     try:
-        db.add(Vote(election_id=e.id, candidate_id=c.id, student_number=student.student_number, transaction_id=tx))
+        db.add(Vote(election_id=e.id, candidate_id=c.id, position=position, student_number=student.student_number, transaction_id=tx))
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(409, "You have already voted")
-    audit(db, student.student_number, "student", "vote_cast", "Vote recorded (choice not logged here)")
+        raise HTTPException(409, f"You have already voted for {position}")
+    audit(db, student.student_number, "student", "vote_cast", f"Vote recorded for {position} (choice not logged here)")
     notify("results")
-    return {"message": "Vote recorded", "transaction_id": tx}
+    all_pos = {pos_key(g[0]) for g in position_groups(db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all())}
+    done = all_pos.issubset(set(mine) | {pos_key(position)})
+    return {"message": "Vote recorded", "transaction_id": tx, "position": position, "complete": done}
 
 
 # ----- Tallying and results -----
 @app.get("/results")
 def results(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    """Hash Map tally, then Quick Sort in descending order of votes. Also returns turnout
-    so the app can draw the real-time pie/bar charts."""
+    """Per position: Hash Map tally, then Quick Sort in descending order of votes. Also returns turnout
+    so the app can draw the real-time pie/bar charts. Students receive totals only."""
     e = get_election(db)
     cands = db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all()
-    names = {c.id: c.full_name for c in cands}
-    cast = db.scalars(select(Vote.candidate_id).where(Vote.election_id == e.id)).all()
-    tally = scoring.count_votes(list(names.keys()), list(cast))
-    ranked = scoring.ranked_results(tally)
-    total = len(cast)
+    votes = db.execute(select(Vote.candidate_id, Vote.student_number).where(Vote.election_id == e.id)).all()
+    rows = []
+    groups = position_groups(cands)
+    for name, group in groups:
+        ids = [c.id for c in group]
+        cast = [cid for cid, _ in votes if cid in set(ids)]
+        tally = scoring.count_votes(ids, cast)
+        ranked = scoring.ranked_results(tally)
+        total = len(cast)
+        names = {c.id: c.full_name for c in group}
+        for i, (cid, v) in enumerate(ranked):
+            rows.append({"position": name, "rank": i + 1, "candidate_id": cid, "full_name": names[cid], "votes": v,
+                         "percent": round(v / total * 100, 2) if total else 0.0})
+    voters = {sn for _, sn in votes}
     eligible = db.scalar(select(func.count()).select_from(User).where(User.role == "student")) or 0
     return {
         "election": election_out(e),
-        "turnout": {"votes_cast": total, "eligible_voters": eligible,
-                    "turnout_percent": round(total / eligible * 100, 2) if eligible else 0.0},
-        "results": [{"rank": i + 1, "candidate_id": cid, "full_name": names[cid], "votes": v,
-                     "percent": round(v / total * 100, 2) if total else 0.0}
-                    for i, (cid, v) in enumerate(ranked)],
+        "turnout": {"votes_cast": len(voters), "eligible_voters": eligible,
+                    "turnout_percent": round(len(voters) / eligible * 100, 2) if eligible else 0.0},
+        "positions": [g[0] for g in groups],
+        "results": rows,
     }
 
 
@@ -717,6 +924,8 @@ def _apply_candidate(c: Candidate, b: CandidateIn):
         v = getattr(b, f)
         if f in ("video_url", "qa") and isinstance(v, str):
             v = v.strip() or None
+        if f == "position" and isinstance(v, str):
+            v = norm_pos(v)
         setattr(c, f, v)
 
 
@@ -778,7 +987,7 @@ def _audit_rows(db: Session, e: Election) -> list[dict]:
     return [{"student_number": v.student_number,
              "full_name": users[v.student_number].full_name if v.student_number in users else "",
              "program": users[v.student_number].program if v.student_number in users else "",
-             "candidate_id": v.candidate_id, "candidate_name": names.get(v.candidate_id, "?"),
+             "position": v.position or "", "candidate_id": v.candidate_id, "candidate_name": names.get(v.candidate_id, "?"),
              "transaction_id": v.transaction_id, "cast_at": v.cast_at.isoformat()} for v in votes]
 
 
@@ -791,11 +1000,17 @@ def vote_audit(admin: User = Depends(require_role("admin")), db: Session = Depen
 @app.get("/admin/voters")
 def voter_list(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
     e = get_election(db)
-    voted = {v.student_number: v.cast_at for v in db.scalars(select(Vote).where(Vote.election_id == e.id))}
+    voted: dict[str, datetime] = {}
+    count: dict[str, int] = {}
+    for v in db.scalars(select(Vote).where(Vote.election_id == e.id)):
+        voted[v.student_number] = max(voted.get(v.student_number, v.cast_at), v.cast_at)
+        count[v.student_number] = count.get(v.student_number, 0) + 1
+    total_pos = len(position_groups(db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all()))
     rows = db.scalars(select(User).where(User.role == "student").order_by(User.student_number)).all()
     return [{"student_number": u.student_number, "full_name": u.full_name, "program": u.program,
              "respondent_code": u.respondent_code, "has_voted": u.student_number in voted,
-             "voted_at": voted[u.student_number].isoformat() if u.student_number in voted else None} for u in rows]
+             "voted_at": voted[u.student_number].isoformat() if u.student_number in voted else None,
+             "positions_voted": count.get(u.student_number, 0), "positions_total": total_pos} for u in rows]
 
 
 @app.get("/admin/turnout")
@@ -817,9 +1032,9 @@ def turnout_by_program(admin: User = Depends(require_role("admin")), db: Session
 def export_votes(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["student_number", "full_name", "program", "candidate", "transaction_id", "cast_at"])
+    w.writerow(["student_number", "full_name", "program", "position", "candidate", "transaction_id", "cast_at"])
     for r in _audit_rows(db, get_election(db)):
-        w.writerow([r["student_number"], r["full_name"], r["program"], r["candidate_name"],
+        w.writerow([r["student_number"], r["full_name"], r["program"], r["position"], r["candidate_name"],
                     r["transaction_id"], r["cast_at"]])
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=votera_votes.csv"})
@@ -850,8 +1065,8 @@ def demo_fill(body: DemoIn, admin: User = Depends(require_role("admin")), db: Se
     e = get_election(db)
     if e.status != "open":
         raise HTTPException(403, "Open the election first")
-    cids = [c.id for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id))]
-    if not cids:
+    groups = position_groups(db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all())
+    if not groups:
         raise HTTPException(409, "No candidates")
     voted = set(db.scalars(select(Vote.student_number).where(Vote.election_id == e.id)))
     pool = [u for u in db.scalars(select(User).where(User.role == "student").order_by(User.student_number))
@@ -859,8 +1074,9 @@ def demo_fill(body: DemoIn, admin: User = Depends(require_role("admin")), db: Se
     random.shuffle(pool)
     added = 0
     for u in pool[:body.count]:
-        db.add(Vote(election_id=e.id, candidate_id=random.choice(cids), student_number=u.student_number,
-                    transaction_id=transaction_id(u.student_number, e.id)))
+        for pname, group in groups:  # one random vote for every position
+            db.add(Vote(election_id=e.id, candidate_id=random.choice(group).id, position=pname, student_number=u.student_number,
+                        transaction_id=transaction_id(u.student_number, e.id, pname)))
         added += 1
     db.commit()
     audit(db, admin.student_number, "admin", "demo_fill", f"{added} demo votes added")
@@ -1117,15 +1333,17 @@ def selftest(admin: User = Depends(require_role("admin")), db: Session = Depends
         eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
         Base.metadata.create_all(eng)
         with Session(eng) as s2:
-            s2.add(Vote(election_id=1, candidate_id=1, student_number="S-1", transaction_id="t1"))
+            s2.add(Vote(election_id=1, candidate_id=1, position="President", student_number="S-1", transaction_id="t1"))
             s2.commit()
-            s2.add(Vote(election_id=1, candidate_id=2, student_number="S-1", transaction_id="t2"))
+            s2.add(Vote(election_id=1, candidate_id=3, position="Vice President", student_number="S-1", transaction_id="t3"))
+            s2.commit()  # a different position is allowed
+            s2.add(Vote(election_id=1, candidate_id=2, position="President", student_number="S-1", transaction_id="t2"))
             try:
                 s2.commit()
-                return False, "A second vote by the same student was accepted"
+                return False, "A second vote by the same student for the same position was accepted"
             except IntegrityError:
-                return True, "A second vote by the same student is refused by the database"
-    check("Voting", "One student, one vote", t_onevote)
+                return True, "One vote per position: a second vote for the same position is refused by the database"
+    check("Voting", "One student, one vote per position", t_onevote)
 
     def t_dupes():
         e = get_election(db)
