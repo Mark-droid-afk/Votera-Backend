@@ -184,6 +184,18 @@ def migrate_votes():
 migrate_votes()
 
 
+def migrate_admin_number():
+    """The administrator login is now ADMIN-000. Renames the old ADMIN-001 account (same password) unless ADMIN-000 already exists."""
+    if not sa_inspect(engine).has_table("users"):
+        return
+    with engine.begin() as conn:
+        if conn.execute(sql_text("SELECT 1 FROM users WHERE student_number = 'ADMIN-000'")).first() is None:
+            conn.execute(sql_text("UPDATE users SET student_number = 'ADMIN-000' WHERE student_number = 'ADMIN-001' AND role = 'admin'"))
+
+
+migrate_admin_number()
+
+
 # ---------------- Security helpers ----------------
 PROGRAMS = ["BSIT", "BTLEd - Home Economics", "BTLEd - ICT", "BSBA - HRM", "BSBA - MM",
             "BS Entrepreneurship", "BPA - Fiscal Administration", "DOMT - Medical Office Management"]
