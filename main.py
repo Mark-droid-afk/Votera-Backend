@@ -133,6 +133,20 @@ class AuditLog(Base):
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class Feedback(Base):
+    """One short usability rating per student (the latest one replaces the earlier one). Used for the survey evidence."""
+    __tablename__ = "feedback"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_number: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    program: Mapped[str] = mapped_column(String(80), default="")
+    ease: Mapped[int] = mapped_column(Integer, default=0)       # 1-5: easy to use
+    clarity: Mapped[int] = mapped_column(Integer, default=0)    # 1-5: clear and understandable
+    trust: Mapped[int] = mapped_column(Integer, default=0)      # 1-5: trust in the result
+    overall: Mapped[int] = mapped_column(Integer, default=0)    # 1-5: overall satisfaction
+    comment: Mapped[str] = mapped_column(String(500), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -430,6 +444,14 @@ class OtpIn(BaseModel):
 
 class VoteIn(BaseModel):
     candidate_id: int
+
+
+class FeedbackIn(BaseModel):
+    ease: int = Field(ge=1, le=5)
+    clarity: int = Field(ge=1, le=5)
+    trust: int = Field(ge=1, le=5)
+    overall: int = Field(ge=1, le=5)
+    comment: str = Field(default="", max_length=500)
 
 
 class StatusIn(BaseModel):
@@ -794,6 +816,57 @@ def cast_vote(body: VoteIn, student: User = Depends(require_role("student")), db
     return {"message": "Vote recorded", "transaction_id": tx, "position": position, "complete": done}
 
 
+@app.get("/vote/verify")
+def verify_receipt(tx: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Checks that a Transaction ID exists. Only the voter who owns it also sees which candidate it was for."""
+    t = (tx or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", t):
+        return {"valid": False, "message": "A Transaction ID has 64 letters and digits (0-9, a-f)."}
+    v = db.scalar(select(Vote).where(Vote.transaction_id == t))
+    if not v:
+        return {"valid": False, "message": "No vote with this Transaction ID was found."}
+    mine = v.student_number == user.student_number
+    out = {"valid": True, "position": v.position or "", "cast_at": v.cast_at.isoformat() + ("Z" if v.cast_at.tzinfo is None else ""),
+           "yours": mine, "message": "This vote is recorded."}
+    if mine:
+        c = db.get(Candidate, v.candidate_id)
+        out["candidate_name"] = c.full_name if c else ""
+    return out
+
+
+@app.post("/feedback")
+def submit_feedback(body: FeedbackIn, student: User = Depends(require_role("student")), db: Session = Depends(get_db)):
+    f = db.scalar(select(Feedback).where(Feedback.student_number == student.student_number))
+    if not f:
+        f = Feedback(student_number=student.student_number)
+        db.add(f)
+    f.program = student.program or ""
+    f.ease, f.clarity, f.trust, f.overall = body.ease, body.clarity, body.trust, body.overall
+    f.comment = re.sub(r"\s+", " ", body.comment).strip()[:500]
+    f.updated_at = utcnow()
+    db.commit()
+    audit(db, student.student_number, "student", "feedback", "Feedback submitted")
+    return {"message": "Thank you for your feedback"}
+
+
+@app.get("/feedback/mine")
+def my_feedback(student: User = Depends(require_role("student")), db: Session = Depends(get_db)):
+    f = db.scalar(select(Feedback).where(Feedback.student_number == student.student_number))
+    if not f:
+        return {"submitted": False}
+    return {"submitted": True, "ease": f.ease, "clarity": f.clarity, "trust": f.trust, "overall": f.overall, "comment": f.comment}
+
+
+@app.get("/admin/feedback")
+def feedback_summary(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Averages and comments. Comments are shown without names (program only)."""
+    rows = db.scalars(select(Feedback).order_by(Feedback.updated_at.desc())).all()
+    n = len(rows)
+    def avg(k): return round(sum(getattr(r, k) for r in rows) / n, 2) if n else 0.0
+    return {"count": n, "ease": avg("ease"), "clarity": avg("clarity"), "trust": avg("trust"), "overall": avg("overall"),
+            "comments": [{"program": r.program, "overall": r.overall, "comment": r.comment} for r in rows if r.comment]}
+
+
 # ----- Tallying and results -----
 @app.get("/results")
 def results(user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -1038,6 +1111,20 @@ def export_votes(admin: User = Depends(require_role("admin")), db: Session = Dep
                     r["transaction_id"], r["cast_at"]])
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=votera_votes.csv"})
+
+
+@app.get("/admin/backup")
+def backup(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """One JSON file with the election, candidates, results, votes, turnout and feedback. No passwords or OTP data."""
+    e = get_election(db)
+    cands = db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all()
+    audit(db, admin.student_number, "admin", "backup", "Backup exported")
+    return {"exported_at": utcnow().isoformat(), "election": {"title": e.title, "status": e.status},
+            "candidates": [{"id": c.id, "full_name": c.full_name, "program": c.program, "position": c.position,
+                            "originality": c.originality_score, "achievements": c.achievements_score, "leadership": c.leadership_score,
+                            "community": c.community_score, "credibility": c.credibility_score} for c in cands],
+            "votes": _audit_rows(db, e), "turnout_by_program": turnout_by_program(admin, db),
+            "feedback": feedback_summary(admin, db)}
 
 
 @app.post("/admin/election/reset")
