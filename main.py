@@ -196,6 +196,18 @@ def migrate_admin_number():
 migrate_admin_number()
 
 
+def migrate_position_names():
+    """Older data used "SSC President". Drops the leading "SSC " from stored positions, so it is just "President"."""
+    insp = sa_inspect(engine)
+    with engine.begin() as conn:
+        for table in ("candidates", "votes"):
+            if insp.has_table(table):
+                conn.execute(sql_text(f"UPDATE {table} SET position = SUBSTR(position, 5) WHERE position LIKE 'SSC %'"))
+
+
+migrate_position_names()
+
+
 # ---------------- Security helpers ----------------
 PROGRAMS = ["BSIT", "BTLEd - Home Economics", "BTLEd - ICT", "BSBA - HRM", "BSBA - MM",
             "BS Entrepreneurship", "BPA - Fiscal Administration", "DOMT - Medical Office Management"]
@@ -225,8 +237,12 @@ def make_token(user: User, scope: str, minutes: int) -> str:
 
 
 def norm_pos(p: str | None) -> str:
-    """Position text with extra spaces removed, for example "  Vice   President " -> "Vice President"."""
-    return " ".join((p or "").split())
+    """Position text with extra spaces removed, for example "  Vice   President " -> "Vice President".
+    A leading "SSC " is dropped ("SSC President" -> "President"), because the position is just the position."""
+    t = " ".join((p or "").split())
+    if t.lower().startswith("ssc ") and len(t) > 4:
+        t = t[4:].strip()
+    return t
 
 
 def pos_key(p: str | None) -> str:
