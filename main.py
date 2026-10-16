@@ -185,12 +185,12 @@ migrate_votes()
 
 
 def migrate_admin_number():
-    """The administrator login is now ADMIN-000. Renames the old ADMIN-001 account (same password) unless ADMIN-000 already exists."""
+    """The administrator login stays ADMIN-001. If an earlier build renamed it to ADMIN-000, it is renamed back (same password)."""
     if not sa_inspect(engine).has_table("users"):
         return
     with engine.begin() as conn:
-        if conn.execute(sql_text("SELECT 1 FROM users WHERE student_number = 'ADMIN-000'")).first() is None:
-            conn.execute(sql_text("UPDATE users SET student_number = 'ADMIN-000' WHERE student_number = 'ADMIN-001' AND role = 'admin'"))
+        if conn.execute(sql_text("SELECT 1 FROM users WHERE student_number = 'ADMIN-001'")).first() is None:
+            conn.execute(sql_text("UPDATE users SET student_number = 'ADMIN-001' WHERE student_number = 'ADMIN-000' AND role = 'admin'"))
 
 
 migrate_admin_number()

@@ -60,7 +60,7 @@ db = SessionLocal()
 import os, csv
 UNIQUE = os.getenv("UNIQUE_PASSWORDS") == "1"
 ALLOCATION = [39, 19, 19, 41, 44, 37, 21, 16]  # Table 1, sums to 236
-db.add(User(student_number="ADMIN-000", full_name="Election Administrator", program="SEC",
+db.add(User(student_number="ADMIN-001", full_name="Election Administrator", program="SEC",
             password_hash=hash_password("admin123"), role="admin", otp_secret=secrets.token_hex(10)))
 programs_for_accounts = [p for p, n in zip(PROGRAMS, ALLOCATION) for _ in range(n)]
 programs_for_accounts += [PROGRAMS[i % len(PROGRAMS)] for i in range(14)]
@@ -125,4 +125,4 @@ db.commit()
 for c in recompute_credibility(db, e.id):
     print(f"{c.full_name:18} similarity={c.highest_similarity:.4f} originality={c.originality_score:6.2f} "
           f"flagged={c.flagged} credibility={c.credibility_score}")
-print(f"Seeded. Admin: ADMIN-000 / admin123. {len(creds)} students: 2022-90001-CM-0 to 2022-{90000+len(creds)}-CM-0 / " + ("see credentials.csv" if UNIQUE else "student123"))
+print(f"Seeded. Admin: ADMIN-001 / admin123. {len(creds)} students: 2022-90001-CM-0 to 2022-{90000+len(creds)}-CM-0 / " + ("see credentials.csv" if UNIQUE else "student123"))
