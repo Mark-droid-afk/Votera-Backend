@@ -1002,6 +1002,50 @@ def _apply_candidate(c: Candidate, b: CandidateIn):
         setattr(c, f, v)
 
 
+# Fictional extra candidates for the other SSC positions, so a demo shows a full ballot. Added from the Admin tab; names are invented.
+# (position, name, program, manifesto, achievements, leadership, community, (achievements score, leadership score, community score))
+SAMPLE_EXTRA = [
+    ("Auditor", "Rafael Domingo", "BPA - Fiscal Administration", "I will check every council expense against its receipt and report the result to students each term. Any difference in the books will be written down, explained, and corrected within one week.", "Accounting quiz bee, second place.", "Class auditor, 2nd and 3rd year.", "Helped count funds for a school fair.", (78, 72, 66)),
+    ("Auditor", "Teresa Villamor", "DOMT - Medical Office Management", "My plan is a yearly inventory of council property with photos and a shared list, plus a surprise cash count twice a semester so nothing is left to trust alone.", "Consistent honor student.", "Org auditor, 3rd year.", "Joined a clothing donation drive.", (82, 68, 70)),
+    ("Publicity and Communications Councilor (PCC)", "Bianca Salazar", "BS Entrepreneurship", "Students should never learn about a council activity too late. I will send one weekly digest with dates, places and deadlines, and answer every message on the council page within a day.", "Campus journalism contest, finalist.", "Org publicity head, 3rd year.", "Wrote announcements for a feeding program.", (74, 76, 72)),
+    ("Publicity and Communications Councilor (PCC)", "Dennis Aquino", "BSIT", "I want one clear place for every memo, form and announcement. A pinned info board in the app and printed copies near the main gate will keep both online and offline students informed.", "Best documentation award, capstone class.", "Class secretary, 2nd year.", "Typed and printed letters for a donation drive.", (70, 70, 68)),
+    ("Creatives and Media Councilor (CMC)", "Camille Ferrer", "BSBA - MM", "Good posters and short videos get students to show up. I will build a simple design kit for the council, train volunteers in basic editing, and produce a highlight video after each big event.", "Poster design contest, first place.", "Creative team lead, org, 3rd year.", "Designed posters for a charity run.", (80, 74, 66)),
+    ("Creatives and Media Councilor (CMC)", "Joaquin Medina", "BTLEd - ICT", "I will set up a small media corner with a camera, a mic and a lighting kit that any student group can borrow, and teach a free weekend workshop on audio and slide design.", "Video editing workshop, certificate.", "Sound crew head, school program.", "Handled the sound system at a community event.", (72, 78, 70)),
+    ("Students' Rights and Welfare Councilor (STRAWC)", "Isabel Cordero", "BPA - Fiscal Administration", "Every student concern deserves a ticket number and an answer. I will review the online helpdesk daily, publish a monthly summary of reports and outcomes, and bring unresolved issues to the right office.", "Debate league, semifinalist.", "Class representative, 3rd year.", "Assisted students with scholarship paperwork.", (76, 80, 82)),
+    ("Students' Rights and Welfare Councilor (STRAWC)", "Marco Dizon", "BSBA - HRM", "I will prepare a short student rights handbook in plain language and hold open consultations each month, so nobody has to guess what they are allowed to ask for.", "Leadership seminar graduate.", "Org vice president, 3rd year.", "Spoke at a barangay youth forum.", (68, 74, 76)),
+    ("Academics and Research Councilor (ARC)", "Hannah Legaspi", "BSIT", "I will start a research buddy program that pairs upper-year students with beginners, share templates for proposals and surveys, and organize a small student research fair every year.", "Research paper presented at a student conference.", "Peer mentor, 3rd year.", "Tutored grade school learners on weekends.", (88, 76, 74)),
+    ("Academics and Research Councilor (ARC)", "Eric Manalo", "BTLEd - Home Economics", "A study space and a printed reviewer shelf can help more students than one big event. I will ask for a quiet room, collect past reviewers, and run exam week study groups.", "Subject topnotcher, 2nd year.", "Study group organizer, 2nd year.", "Ran a free review session for freshmen.", (79, 66, 70)),
+    ("Gender and Development Councilor (GADC)", "Patricia Soriano", "BS Entrepreneurship", "Everyone should feel safe in class and online. I will hold orientation sessions on respect and consent, set a private way to ask for help, and work with the guidance office on regular check-ins.", "Gender awareness seminar, speaker.", "Org advocacy officer, 3rd year.", "Helped organize an inclusivity week.", (74, 78, 84)),
+    ("Gender and Development Councilor (GADC)", "Samuel Pineda", "BSBA - HRM", "I will make campus events open to all by checking schedules, restrooms and seating, and I will invite student groups to share their stories during a yearly culture night.", "Cultural night host, 2nd year.", "Class vice president, 2nd year.", "Volunteered at a community health fair.", (66, 72, 78)),
+    ("External Affairs and Partnership Councilor (EAPC)", "Lorraine Estrada", "BSBA - MM", "I will send partnership proposals to local shops and companies, keep a public list of every sponsor and what they gave, and bring back internship leads for graduating students.", "Sales pitch competition, finalist.", "Org external officer, 3rd year.", "Raised supplies for a school gift giving.", (73, 79, 71)),
+    ("External Affairs and Partnership Councilor (EAPC)", "Vincent Alonzo", "BPA - Fiscal Administration", "Strong partners start with clear letters and quick follow-ups. I will keep a contact directory, thank every sponsor in public, and invite other campuses to joint community projects.", "Public administration case study, second place.", "Class secretary, 3rd year.", "Coordinated a joint outreach with another school.", (70, 69, 77)),
+    ("Logistics and Technical Councilor (LTC)", "Nathaniel Robles", "BSIT", "Events fail when the venue and the equipment are not ready. I will walk through every venue the day before, keep a checklist for the projector, the sound and the extension cords, and prepare floor plans in advance.", "Technical support volunteer, school program.", "Equipment in charge, org, 3rd year.", "Set up chairs and a stage for a community event.", (72, 80, 74)),
+    ("Logistics and Technical Councilor (LTC)", "Gloria Tuazon", "BTLEd - ICT", "I will label all council equipment, maintain a borrowing log, and test every device before an event, then send a short post-event report listing what worked and what needs repair.", "Best in computer repair skills test.", "Tech committee member, 2nd year.", "Fixed computers for a barangay learning center.", (77, 70, 69)),
+]
+
+
+@app.post("/admin/demo/candidates")
+def demo_candidates(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Adds fictional candidates for Auditor and the councilor positions (two each). Safe to press twice: names already present are skipped."""
+    e = get_election(db)
+    if db.scalar(select(func.count()).select_from(Vote).where(Vote.election_id == e.id)):
+        raise HTTPException(409, "Votes have already been cast. Reset the election before adding sample candidates.")
+    have = {(c.full_name, pos_key(c.position or "")) for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id))}
+    added = 0
+    for pos, name, prog, man, ach, lead, comm, (sa, sl, sc) in SAMPLE_EXTRA:
+        if (name, pos_key(pos)) in have:
+            continue
+        db.add(Candidate(election_id=e.id, full_name=name, program=prog, position=pos, manifesto=man, achievements=ach, leadership=lead,
+                         community=comm, achievements_score=sa, leadership_score=sl, community_score=sc))
+        added += 1
+    db.commit()
+    if added:
+        recompute_credibility(db, e.id)
+        audit(db, admin.student_number, "admin", "demo_candidates", f"{added} sample candidates added")
+        notify("candidates", "results")
+    return {"added": added}
+
+
 @app.post("/admin/candidates")
 def add_candidate(body: CandidateIn, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
     """Add a candidate. TF-IDF similarity and credibility are recomputed for the whole field, because a new
