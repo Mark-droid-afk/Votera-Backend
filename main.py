@@ -133,6 +133,23 @@ class AuditLog(Base):
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class Proof(Base):
+    """A picture of a certificate or other document that backs up a candidate's achievements, leadership or community claim."""
+    __tablename__ = "proofs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), index=True)
+    category: Mapped[str] = mapped_column(String(16))             # achievements | leadership | community
+    caption: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(10), default="verified")   # verified | rejected (rejected is hidden from students)
+    mime: Mapped[str] = mapped_column(String(20), default="image/jpeg")
+    data: Mapped[bytes] = mapped_column(LargeBinary, deferred=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    issuer: Mapped[str | None] = mapped_column(String(80), nullable=True)       # who issued the certificate (school office, organization)
+    issued_on: Mapped[str | None] = mapped_column(String(20), nullable=True)    # when, as the administrator writes it (2025, March 2025)
+    verified_by: Mapped[str | None] = mapped_column(String(40), nullable=True)  # administrator who checked it
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class Feedback(Base):
     """One short usability rating per student (the latest one replaces the earlier one). Used for the survey evidence."""
     __tablename__ = "feedback"
@@ -526,6 +543,16 @@ class ScoresIn(BaseModel):
 
 def candidate_out(c: Candidate, admin: bool = False) -> dict:
     d = _candidate_base(c)
+    from sqlalchemy.orm import object_session
+    sess = object_session(c)
+    if sess is not None:   # how many proof documents (students count only the verified ones)
+        q = select(func.count()).select_from(Proof).where(Proof.candidate_id == c.id)
+        d["proof_count"] = int(sess.scalar(q if admin else q.where(Proof.status == "verified")) or 0)
+        rows = sess.execute(select(Proof.category, func.count()).where(Proof.candidate_id == c.id, Proof.status == "verified").group_by(Proof.category)).all()
+        by = {k: n for k, n in rows}
+        d["proof_achievements"], d["proof_leadership"], d["proof_community"] = (int(by.get(k, 0)) for k in PROOF_CATEGORIES)
+        if admin:   # written claims that no verified document backs up yet
+            d["missing_proof"] = [k for k in PROOF_CATEGORIES if (getattr(c, k) or "").strip() and not by.get(k)]
     if admin:  # which manifesto it resembles is shown to administrators only
         d["most_similar_name"] = c.most_similar_name
     return d
@@ -538,7 +565,8 @@ def _candidate_base(c: Candidate) -> dict:
             "originality_score": c.originality_score, "flagged": c.flagged,
             "achievements_score": c.achievements_score, "leadership_score": c.leadership_score,
             "community_score": c.community_score, "credibility_score": c.credibility_score,
-            "photo_version": c.photo_version or 0, "video_url": c.video_url, "qa": c.qa}
+            "photo_version": c.photo_version or 0, "video_url": c.video_url, "qa": c.qa, "proof_count": 0,
+            "proof_achievements": 0, "proof_leadership": 0, "proof_community": 0, "missing_proof": []}
 
 
 # ---------------- Application layer ----------------
@@ -1236,6 +1264,7 @@ def delete_candidate(candidate_id: int, admin: User = Depends(require_role("admi
         raise HTTPException(409, "This candidate already has votes. Reset the election to remove them.")
     eid = c.election_id
     nm = c.full_name
+    db.query(Proof).filter(Proof.candidate_id == c.id).delete()
     db.delete(c)
     db.commit()
     audit(db, admin.student_number, "admin", "candidate_deleted", nm)
@@ -1404,6 +1433,123 @@ def delete_photo(candidate_id: int, admin: User = Depends(require_role("admin"))
     db.commit()
     notify("candidates")
     return candidate_out(c, True)
+
+
+# ---------------- Proof documents (certificates) ----------------
+PROOF_CATEGORIES = ("achievements", "leadership", "community")
+MAX_PROOFS_PER_CATEGORY = 6
+
+
+def _proof_out(p: Proof, admin: bool = True) -> dict:
+    d = {"id": p.id, "candidate_id": p.candidate_id, "category": p.category, "caption": p.caption, "status": p.status,
+         "created_at": p.created_at.isoformat() + "Z" if p.created_at else None,
+         "issuer": p.issuer or "", "issued_on": p.issued_on or "",
+         "verified_at": p.verified_at.isoformat() + "Z" if p.verified_at and p.status == "verified" else None}
+    if admin:   # which administrator checked it is shown to administrators only
+        d["verified_by"] = p.verified_by
+    return d
+
+
+@app.get("/candidates/{candidate_id}/proofs")
+def list_proofs(candidate_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Students see the verified documents; the administrator sees all of them (including rejected ones)."""
+    q = select(Proof).where(Proof.candidate_id == candidate_id).order_by(Proof.category, Proof.id)
+    if user.role != "admin":
+        q = q.where(Proof.status == "verified")
+    return [_proof_out(p, user.role == "admin") for p in db.scalars(q)]
+
+
+@app.get("/proofs/{proof_id}/image")
+def get_proof_image(proof_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    p = db.get(Proof, proof_id)
+    if not p or (user.role != "admin" and p.status != "verified"):
+        raise HTTPException(404, "No such document")
+    return Response(p.data, media_type=p.mime or "image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.post("/admin/candidates/{candidate_id}/proofs")
+async def add_proof(candidate_id: int, request: Request, category: str = "achievements", caption: str = "",
+                    issuer: str = "", issued_on: str = "", admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Body is the raw image bytes (JPEG or PNG, up to 3 MB). The app shrinks the picture before sending."""
+    if category not in PROOF_CATEGORIES:
+        raise HTTPException(422, "category must be achievements, leadership or community")
+    c = db.get(Candidate, candidate_id)
+    if not c:
+        raise HTTPException(404, "Candidate not found")
+    data = await request.body()
+    if len(data) > 3_000_000:
+        raise HTTPException(413, "Picture is too large (max 3 MB)")
+    if data[:3] == b"\xff\xd8\xff":
+        kind = "image/jpeg"
+    elif data[:8] == b"\x89PNG\r\n\x1a\n":
+        kind = "image/png"
+    else:
+        raise HTTPException(415, "Use a JPEG or PNG picture")
+    n = db.scalar(select(func.count()).select_from(Proof).where(Proof.candidate_id == c.id, Proof.category == category))
+    if n >= MAX_PROOFS_PER_CATEGORY:
+        raise HTTPException(409, f"At most {MAX_PROOFS_PER_CATEGORY} documents for each category")
+    clean = lambda t, n: re.sub(r"\s+", " ", t).strip()[:n]
+    p = Proof(candidate_id=c.id, category=category, caption=clean(caption, 120), issuer=clean(issuer, 80) or None,
+              issued_on=clean(issued_on, 20) or None, mime=kind, data=data, verified_by=admin.student_number, verified_at=utcnow())
+    db.add(p)
+    db.commit()
+    audit(db, admin.student_number, "admin", "proof_added", f"{c.full_name}: {category}")
+    notify("candidates")
+    return _proof_out(p)
+
+
+class ProofPatch(BaseModel):
+    status: str | None = None
+    caption: str | None = Field(default=None, max_length=120)
+    issuer: str | None = Field(default=None, max_length=80)
+    issued_on: str | None = Field(default=None, max_length=20)
+
+
+@app.patch("/admin/proofs/{proof_id}")
+def patch_proof(proof_id: int, body: ProofPatch, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    p = db.get(Proof, proof_id)
+    if not p:
+        raise HTTPException(404, "No such document")
+    if body.status is not None:
+        if body.status not in ("verified", "rejected"):
+            raise HTTPException(422, "status must be verified or rejected")
+        if body.status != p.status:
+            p.verified_by, p.verified_at = admin.student_number, utcnow()
+        p.status = body.status
+    if body.caption is not None:
+        p.caption = body.caption.strip()[:120]
+    if body.issuer is not None:
+        p.issuer = body.issuer.strip()[:80] or None
+    if body.issued_on is not None:
+        p.issued_on = body.issued_on.strip()[:20] or None
+    db.commit()
+    audit(db, admin.student_number, "admin", "proof_updated", f"#{p.id} {p.status}")
+    notify("candidates")
+    return _proof_out(p)
+
+
+@app.get("/admin/proofs/summary")
+def proofs_summary(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """For the checklist and the report: documents on file per candidate and which written claims have no verified document yet."""
+    e = get_election(db)
+    out = []
+    for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id).order_by(Candidate.id)):
+        d = candidate_out(c, True)
+        out.append({"candidate_id": c.id, "full_name": c.full_name, "position": c.position, "documents": d["proof_count"],
+                    "missing": d["missing_proof"]})
+    return {"candidates": out, "missing_total": sum(len(x["missing"]) for x in out)}
+
+
+@app.delete("/admin/proofs/{proof_id}")
+def delete_proof(proof_id: int, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    p = db.get(Proof, proof_id)
+    if not p:
+        raise HTTPException(404, "No such document")
+    db.delete(p)
+    db.commit()
+    audit(db, admin.student_number, "admin", "proof_deleted", f"#{proof_id}")
+    notify("candidates")
+    return {"deleted": proof_id}
 
 
 # ---------------- Admin: add voters from a spreadsheet (CSV) ----------------
