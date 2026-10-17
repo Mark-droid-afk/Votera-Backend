@@ -966,10 +966,21 @@ def _apply_admin_password():
         db.close()
 
 
+def _startup_samples():
+    db = SessionLocal()
+    try:
+        ensure_sample_candidates(db)
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 async def _capture_loop():
     global _autoclose_task
     await asyncio.to_thread(_apply_admin_password)
+    await asyncio.to_thread(_startup_samples)
     manager.loop = asyncio.get_running_loop()
     _autoclose_task = asyncio.create_task(_autoclose_loop())
 
@@ -1030,9 +1041,18 @@ def _apply_candidate(c: Candidate, b: CandidateIn):
         setattr(c, f, v)
 
 
-# Fictional extra candidates for the other SSC positions, so a demo shows a full ballot. Added from the Admin tab; names are invented.
+# Fictional candidates for all 12 SSC positions (two each), so a demo shows a full ballot. Names are invented.
+# They are added once automatically (see ensure_sample_candidates) and can be edited or removed in the Admin tab.
 # (position, name, program, manifesto, achievements, leadership, community, (achievements score, leadership score, community score))
-SAMPLE_EXTRA = [
+SAMPLE_CANDIDATES = [
+    ('President', 'Ana Reyes', 'BSIT', 'I will make student services faster and easier by bringing enrollment concerns, scholarship updates, and clearance steps into one clear online guide. I will also open a mental health desk with trained peer listeners and partner with the guidance office for regular wellness weeks.', "Dean's Lister, three semesters. Hackathon finalist, 2025.", 'Class president, 2nd year. Org vice president, 3rd year.', 'Led a donation drive for flood-affected families.', (90, 85, 80)),
+    ('President', 'Miguel Santos', 'BSBA - HRM', 'I will push for a student council that listens first and acts fast. My platform focuses on free tutoring programs, a transparent budget report every month, and stronger support for student organizations across all programs. Every student deserves a voice, and I will make sure every concern reaches the administration.', 'Best Thesis Proposal, department level.', 'Org treasurer, 3rd year. Class secretary, 2nd year.', 'Volunteer in a campus tree-planting activity.', (70, 75, 60)),
+    ('Vice President', 'Carla Mendoza', 'BSBA - MM', 'I will push for a student council that listens first and acts quickly. My platform focuses on free tutoring programs, a transparent budget report every month, and stronger support for student organizations across all programs. Every student deserves a voice, and I will make sure each concern reaches the administration.', 'Marketing case competition participant.', 'Class representative, 3rd year.', 'Joined a literacy outreach program.', (60, 65, 70)),
+    ('Vice President', 'Paolo Villanueva', 'BS Entrepreneurship', 'My focus is campus life outside the classroom. I will organize quarterly sports fests and cultural nights, create a job fair with partner companies for graduating students, and set up a small business bazaar where student entrepreneurs can sell on campus at no cost.', 'Startup pitch competition, second place.', 'Org president, 3rd and 4th year.', 'Organized a livelihood training for a nearby community.', (75, 90, 85)),
+    ('Secretary-General', 'Liza Navarro', 'BTLEd - ICT', 'I will work with the administration on safer walkways, better lighting, working restrooms, and accessible ramps and elevators for students with mobility needs. I will also press for fair canteen prices and a monthly open forum where students can question the council directly.', 'Academic excellence award, 2nd year.', 'Peer tutor coordinator. Class vice president, 3rd year.', 'Regular blood donation drive volunteer.', (85, 80, 90)),
+    ('Secretary-General', 'Jose Ramos', 'BPA - Fiscal Administration', 'Council records should be easy for any student to read. I will post short minutes within two days of every meeting, keep one public calendar of council activities, and set up a suggestion box that is answered in writing every week.', 'Best in Public Speaking, 2nd year.', 'Org secretary, 3rd year.', 'Helped organize a school supplies giveaway.', (65, 70, 65)),
+    ('Treasurer', 'Maria Cruz', 'DOMT - Medical Office Management', 'Every peso of council funds should have a receipt a student can see. I will publish a simple income and spending sheet each month, ask students to vote on how leftover funds are used, and cut costs on events by asking partner shops for discounts.', 'Scholar with high honors, 2nd and 3rd year.', 'Org auditor, 3rd year.', 'Joined a community health outreach.', (80, 70, 75)),
+    ('Treasurer', 'Noel Bautista', 'BTLEd - Home Economics', 'I want a council that runs on fundraising, not on student fees. My plan is a cooking and baking sale each term, a recycling drive that turns used paper into funds, and a clear signboard that shows what each activity earned and what it cost.', 'Home economics skills competition, regional participant.', 'Class treasurer, 2nd and 3rd year.', 'Fed families during a relief operation.', (70, 65, 80)),
     ("Auditor", "Rafael Domingo", "BPA - Fiscal Administration", "I will check every council expense against its receipt and report the result to students each term. Any difference in the books will be written down, explained, and corrected within one week.", "Accounting quiz bee, second place.", "Class auditor, 2nd and 3rd year.", "Helped count funds for a school fair.", (78, 72, 66)),
     ("Auditor", "Teresa Villamor", "DOMT - Medical Office Management", "My plan is a yearly inventory of council property with photos and a shared list, plus a surprise cash count twice a semester so nothing is left to trust alone.", "Consistent honor student.", "Org auditor, 3rd year.", "Joined a clothing donation drive.", (82, 68, 70)),
     ("Publicity and Communications Councilor (PCC)", "Bianca Salazar", "BS Entrepreneurship", "Students should never learn about a council activity too late. I will send one weekly digest with dates, places and deadlines, and answer every message on the council page within a day.", "Campus journalism contest, finalist.", "Org publicity head, 3rd year.", "Wrote announcements for a feeding program.", (74, 76, 72)),
@@ -1052,15 +1072,11 @@ SAMPLE_EXTRA = [
 ]
 
 
-@app.post("/admin/demo/candidates")
-def demo_candidates(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
-    """Adds fictional candidates for Auditor and the councilor positions (two each). Safe to press twice: names already present are skipped."""
-    e = get_election(db)
-    if db.scalar(select(func.count()).select_from(Vote).where(Vote.election_id == e.id)):
-        raise HTTPException(409, "Votes have already been cast. Reset the election before adding sample candidates.")
+def _add_sample_candidates(db: Session, e: Election) -> int:
+    """Adds the fictional candidates that are not on the ballot yet (matched by name and position). Returns how many were added."""
     have = {(c.full_name, pos_key(c.position or "")) for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id))}
     added = 0
-    for pos, name, prog, man, ach, lead, comm, (sa, sl, sc) in SAMPLE_EXTRA:
+    for pos, name, prog, man, ach, lead, comm, (sa, sl, sc) in SAMPLE_CANDIDATES:
         if (name, pos_key(pos)) in have:
             continue
         db.add(Candidate(election_id=e.id, full_name=name, program=prog, position=pos, manifesto=man, achievements=ach, leadership=lead,
@@ -1069,6 +1085,34 @@ def demo_candidates(admin: User = Depends(require_role("admin")), db: Session = 
     db.commit()
     if added:
         recompute_credibility(db, e.id)
+    return added
+
+
+def ensure_sample_candidates(db: Session) -> int:
+    """Puts the fictional candidates for every position on the ballot, once. Skipped when votes already exist, when it was done before
+    (so removing a sample candidate stays removed), or when VOTERA_AUTO_SAMPLES=0."""
+    if os.getenv("VOTERA_AUTO_SAMPLES", "1") == "0":
+        return 0
+    e = db.scalar(select(Election).order_by(Election.id))
+    if not e or db.scalar(select(func.count()).select_from(Vote).where(Vote.election_id == e.id)):
+        return 0
+    if db.scalar(select(AuditLog.id).where(AuditLog.action == "samples_seeded")):
+        return 0
+    added = _add_sample_candidates(db, e)
+    audit(db, "system", "", "samples_seeded", f"{added} sample candidates added automatically")
+    if added:
+        notify("candidates", "results")
+    return added
+
+
+@app.post("/admin/demo/candidates")
+def demo_candidates(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Adds the fictional candidates that are missing (all 12 positions). Safe to repeat. Not allowed after votes are cast."""
+    e = get_election(db)
+    if db.scalar(select(func.count()).select_from(Vote).where(Vote.election_id == e.id)):
+        raise HTTPException(409, "Votes have already been cast. Reset the election before adding sample candidates.")
+    added = _add_sample_candidates(db, e)
+    if added:
         audit(db, admin.student_number, "admin", "demo_candidates", f"{added} sample candidates added")
         notify("candidates", "results")
     return {"added": added}
@@ -1208,6 +1252,7 @@ def reset_election(admin: User = Depends(require_role("admin")), db: Session = D
     e.closes_at = None
     db.commit()
     audit(db, admin.student_number, "admin", "election_reset", f"{n} votes removed")
+    ensure_sample_candidates(db)  # with no votes left, the sample candidates for every position can be added (once)
     notify("election", "results", "candidates")
     return {"votes_removed": n, "status": e.status}
 
