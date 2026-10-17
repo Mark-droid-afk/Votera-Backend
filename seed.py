@@ -2,25 +2,11 @@
 import secrets
 import io, random
 from main import (Base, engine, SessionLocal, User, Election, Candidate, Announcement,
-                  hash_password, recompute_credibility, PROGRAMS)
+                  hash_password, recompute_credibility, PROGRAMS, STUDENT_TOTAL, account_programs, fictional_names)
 
 # Fictional voter names: random first-name + surname combinations, so the Voters list shows names, not "Student 1".
 # They are made up for the simulation and do not refer to real students.
-FIRST = ["Juan", "Maria", "Jose", "Ana", "Mark", "Angela", "John", "Kimberly", "Carlo", "Jasmine", "Paolo", "Bianca",
-         "Miguel", "Nicole", "Gabriel", "Rhea", "Joshua", "Camille", "Daniel", "Patricia", "Christian", "Sofia",
-         "Ryan", "Katrina", "Emmanuel", "Louise", "Francis", "Trisha", "Adrian", "Mariel", "Vincent", "Danica",
-         "Kenneth", "Jessa", "Rafael", "Ellaine", "Jerome", "Hannah", "Lance", "Aileen"]
-LAST = ["Santos", "Reyes", "Cruz", "Bautista", "Ocampo", "Garcia", "Mendoza", "Torres", "Tomas", "Andrada", "Castillo",
-        "Flores", "Villanueva", "Ramos", "Aquino", "Dela Cruz", "Navarro", "Salazar", "Domingo", "Gonzales", "Lopez",
-        "Pascual", "Soriano", "Rivera", "Valdez", "Mercado", "Aguilar", "Manalo", "Esguerra", "Corpuz", "Hernandez",
-        "Perez", "Fernandez", "Diaz", "Morales", "Silva", "Padilla", "Macaraeg", "Lim", "Tan"]
-
-
-def fictional_names(n, seed=2026):
-    rng = random.Random(seed)
-    pairs = [(f, l) for f in FIRST for l in LAST]
-    rng.shuffle(pairs)
-    return [f"{f} {l}" for f, l in pairs[:n]]
+# (names, program split and the account count come from main.py so the seed and the startup top-up always agree)
 
 
 def avatar_jpeg(bg, fg):
@@ -52,18 +38,16 @@ Base.metadata.create_all(engine)
 db = SessionLocal()
 
 # Pre-loaded accounts (the prototype has no student-records integration).
-# 250 fictional voter accounts: 236 follow Table 1 (proportional allocation across the eight programs)
+# 500 fictional voter accounts by default (set VOTERA_STUDENT_ACCOUNTS to change): the Table 1 proportions across the eight programs
 # plus 14 spare accounts for testers. Student numbers use the PUP format YYYY-NNNNN-CM-N and are
 # fictional (the 9xxxx range), not real students.
 # Shared password mode (default): everyone uses "student123".
 # Unique password mode:  UNIQUE_PASSWORDS=1 python seed.py  -> random password per account, saved to credentials.csv
 import os, csv
 UNIQUE = os.getenv("UNIQUE_PASSWORDS") == "1"
-ALLOCATION = [39, 19, 19, 41, 44, 37, 21, 16]  # Table 1, sums to 236
 db.add(User(student_number="ADMIN-001", full_name="Election Administrator", program="SEC",
             password_hash=hash_password("admin123"), role="admin", otp_secret=secrets.token_hex(10)))
-programs_for_accounts = [p for p, n in zip(PROGRAMS, ALLOCATION) for _ in range(n)]
-programs_for_accounts += [PROGRAMS[i % len(PROGRAMS)] for i in range(14)]
+programs_for_accounts = account_programs(STUDENT_TOTAL or 500)   # Table 1 split scaled to the total, plus 14 spare testers
 shared_hash = hash_password("student123")  # one bcrypt hash reused so seeding stays fast
 creds = []
 names = fictional_names(len(programs_for_accounts))

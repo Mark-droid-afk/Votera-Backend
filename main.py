@@ -969,6 +969,10 @@ def _apply_admin_password():
 def _startup_samples():
     db = SessionLocal()
     try:
+        ensure_student_accounts(db)
+    except Exception:
+        db.rollback()
+    try:
         ensure_sample_candidates(db)
     except Exception:
         db.rollback()
@@ -1039,6 +1043,70 @@ def _apply_candidate(c: Candidate, b: CandidateIn):
         if f == "position" and isinstance(v, str):
             v = norm_pos(v)
         setattr(c, f, v)
+
+
+# ---------------- Fictional student accounts (top-up) ----------------
+# Table 1 allocation across the eight programs (sums to 236), scaled up when more accounts are wanted.
+TABLE1_ALLOCATION = [39, 19, 19, 41, 44, 37, 21, 16]
+FIRST_NAMES = ["Juan", "Maria", "Jose", "Ana", "Mark", "Angela", "John", "Kimberly", "Carlo", "Jasmine", "Paolo", "Bianca",
+               "Miguel", "Nicole", "Gabriel", "Rhea", "Joshua", "Camille", "Daniel", "Patricia", "Christian", "Sofia",
+               "Ryan", "Katrina", "Emmanuel", "Louise", "Francis", "Trisha", "Adrian", "Mariel", "Vincent", "Danica",
+               "Kenneth", "Jessa", "Rafael", "Ellaine", "Jerome", "Hannah", "Lance", "Aileen"]
+LAST_NAMES = ["Santos", "Reyes", "Cruz", "Bautista", "Ocampo", "Garcia", "Mendoza", "Torres", "Tomas", "Andrada", "Castillo",
+              "Flores", "Villanueva", "Ramos", "Aquino", "Dela Cruz", "Navarro", "Salazar", "Domingo", "Gonzales", "Lopez",
+              "Pascual", "Soriano", "Rivera", "Valdez", "Mercado", "Aguilar", "Manalo", "Esguerra", "Corpuz", "Hernandez",
+              "Perez", "Fernandez", "Diaz", "Morales", "Silva", "Padilla", "Macaraeg", "Lim", "Tan"]
+STUDENT_TOTAL = int(os.getenv("VOTERA_STUDENT_ACCOUNTS", "500"))
+
+
+def fictional_names(n: int, seed: int = 2026) -> list[str]:
+    import random
+    rng = random.Random(seed)
+    pairs = [(f, l) for f in FIRST_NAMES for l in LAST_NAMES]
+    rng.shuffle(pairs)
+    return [f"{f} {l}" for f, l in pairs[:n]]
+
+
+def account_programs(total: int) -> list[str]:
+    """Program for each account number 1..total: the first 236-scaled share follows Table 1, the last 14 are spare testers."""
+    spare = 14
+    main_n = max(total - spare, 0)
+    base = sum(TABLE1_ALLOCATION)
+    raw = [a * main_n / base for a in TABLE1_ALLOCATION]
+    counts = [int(x) for x in raw]
+    for i in sorted(range(len(raw)), key=lambda i: raw[i] - counts[i], reverse=True)[:main_n - sum(counts)]:
+        counts[i] += 1
+    progs = [p for p, n in zip(PROGRAMS, counts) for _ in range(n)]
+    return progs + [PROGRAMS[i % len(PROGRAMS)] for i in range(spare)]
+
+
+def ensure_student_accounts(db: Session, total: int = None) -> int:
+    """Adds the fictional accounts 2022-90001-CM-0 .. 2022-9NNNN-CM-0 that are missing (password student123), once per target size.
+    Never touches existing accounts, votes or candidates. Set VOTERA_STUDENT_ACCOUNTS=0 to switch it off."""
+    total = STUDENT_TOTAL if total is None else total
+    if total <= 0:
+        return 0
+    marker = f"students_topup_{total}"
+    if db.scalar(select(AuditLog.id).where(AuditLog.action == marker)):
+        return 0
+    if not db.scalar(select(User.id).where(User.role == "student")):
+        return 0       # empty database: seed.py creates the accounts
+    have = set(db.scalars(select(User.student_number)))
+    codes = set(db.scalars(select(User.respondent_code)))
+    progs, names, shared = account_programs(total), fictional_names(total), hash_password("student123")
+    added = 0
+    for i in range(1, total + 1):
+        sn = f"2022-{90000 + i:05d}-CM-0"
+        rc = f"R-{i:03d}"
+        if sn in have:
+            continue
+        db.add(User(student_number=sn, full_name=names[i - 1], program=progs[i - 1], respondent_code=rc if rc not in codes else None,
+                    password_hash=shared, role="student", otp_secret=secrets.token_hex(10)))
+        added += 1
+    db.commit()
+    audit(db, "system", "", marker, f"{added} fictional student accounts added")
+    return added
+
 
 
 # Fictional candidates for all 12 SSC positions (two each), so a demo shows a full ballot. Names are invented.
