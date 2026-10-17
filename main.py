@@ -56,6 +56,9 @@ class User(Base):
     otp_counter: Mapped[int] = mapped_column(Integer, default=0)
     otp_pending: Mapped[bool] = mapped_column(Boolean, default=False)
     respondent_code: Mapped[str | None] = mapped_column(String(12), nullable=True)  # e.g. R-017, for matching the two surveys without names
+    last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)         # last successful sign-in (UTC)
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)          # last request with a valid token (UTC, updated at most once a minute)
+    tokens_valid_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # sessions started before this moment are ended
 
 
 class Election(Base):
@@ -87,6 +90,7 @@ class Candidate(Base):
     most_similar_name: Mapped[str | None] = mapped_column(String(120), nullable=True)  # explainability for the admin
     video_url: Mapped[str | None] = mapped_column(String(300), nullable=True)  # optional link to a platform video
     qa: Mapped[str | None] = mapped_column(Text, nullable=True)  # optional questions and answers, plain text
+    published: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=True)  # False = draft, hidden from students (None counts as published)
     # Administrator-entered criterion scores (0-100)
     achievements_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     leadership_score: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -119,6 +123,7 @@ class Announcement(Base):
     image: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)  # optional picture on the post
     image_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     image_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    publish_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # scheduled posts stay hidden from students until this moment (UTC)
 
 
 class AuditLog(Base):
@@ -249,7 +254,7 @@ def hotp(secret: str, counter: int, digits: int = 6) -> str:
 
 def make_token(user: User, scope: str, minutes: int) -> str:
     payload = {"sub": str(user.id), "scope": scope, "role": user.role,
-               "exp": utcnow() + timedelta(minutes=minutes)}
+               "iat": int(time.time()), "iatms": int(time.time() * 1000), "exp": utcnow() + timedelta(minutes=minutes)}
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 
@@ -293,6 +298,16 @@ def position_rank(p: str) -> tuple[int, str]:
     if "auditor" in k:
         return (4, k)
     return (100, k)
+
+
+def is_published(c: "Candidate") -> bool:
+    """A candidate is on the student ballot unless the administrator kept it as a draft (older rows have no value and count as published)."""
+    return c.published is None or bool(c.published)
+
+
+def ballot_candidates(db: Session, e: "Election") -> list:
+    """The candidates students can see and vote for."""
+    return [c for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id).order_by(Candidate.id)) if is_published(c)]
 
 
 def position_groups(cands: list) -> list[tuple[str, list]]:
@@ -396,6 +411,12 @@ def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer), db: Sessi
     user = db.get(User, int(p["sub"]))
     if not user:
         raise HTTPException(401, "User not found")
+    if user.tokens_valid_after and int(p.get("iatms") or 0) <= int(user.tokens_valid_after.replace(tzinfo=timezone.utc).timestamp() * 1000):
+        raise HTTPException(401, "Your session was ended by the administrator. Log in again.")
+    now = now_naive()
+    if not user.last_seen or (now - user.last_seen).total_seconds() > 60:
+        user.last_seen = now       # shows who is online in Admin > Activity (written at most once a minute)
+        db.commit()
     return user
 
 
@@ -511,6 +532,7 @@ class AnnouncementIn(BaseModel):
     body: str = Field(default="", max_length=1000)
     category: str = "General"
     pinned: bool = False
+    publish_in_minutes: int | None = Field(default=None, ge=1, le=60 * 24 * 30)   # None = publish now
 
 
 class AnnouncementEdit(BaseModel):
@@ -533,6 +555,11 @@ class CandidateIn(BaseModel):
     community_score: float | None = Field(default=None, ge=0, le=100)
     video_url: str | None = Field(default=None, max_length=300)
     qa: str | None = Field(default=None, max_length=4000)
+    published: bool | None = None   # None = leave as it is (new candidates are published)
+
+
+class PublishedIn(BaseModel):
+    published: bool
 
 
 class ScoresIn(BaseModel):
@@ -565,7 +592,7 @@ def _candidate_base(c: Candidate) -> dict:
             "originality_score": c.originality_score, "flagged": c.flagged,
             "achievements_score": c.achievements_score, "leadership_score": c.leadership_score,
             "community_score": c.community_score, "credibility_score": c.credibility_score,
-            "photo_version": c.photo_version or 0, "video_url": c.video_url, "qa": c.qa, "proof_count": 0,
+            "photo_version": c.photo_version or 0, "video_url": c.video_url, "qa": c.qa, "published": is_published(c), "proof_count": 0,
             "proof_achievements": 0, "proof_leadership": 0, "proof_community": 0, "missing_proof": []}
 
 
@@ -628,6 +655,7 @@ def verify_otp(body: OtpIn, db: Session = Depends(get_db)):
             raise HTTPException(429, lock_message(LOCK_SECONDS))
         raise HTTPException(401, "Incorrect OTP")
     user.otp_pending = False  # single use
+    user.last_login = user.last_seen = now_naive()
     db.commit()
     clear_fails(user.student_number)
     audit(db, user.student_number, user.role, "login", "Signed in")
@@ -658,13 +686,15 @@ def set_status(body: StatusIn, admin: User = Depends(require_role("admin")), db:
 def list_candidates(user: User = Depends(current_user), db: Session = Depends(get_db)):
     e = get_election(db)
     rows = db.scalars(select(Candidate).where(Candidate.election_id == e.id).order_by(Candidate.id)).all()
+    if user.role != "admin":
+        rows = [c for c in rows if is_published(c)]
     return [candidate_out(c, user.role == "admin") for c in rows]
 
 
 @app.get("/candidates/{candidate_id}")
 def get_candidate(candidate_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     c = db.get(Candidate, candidate_id)
-    if not c:
+    if not c or (user.role != "admin" and not is_published(c)):
         raise HTTPException(404, "Candidate not found")
     return candidate_out(c, user.role == "admin")
 
@@ -715,7 +745,9 @@ def _category(c: str | None) -> str:
 
 def announcement_out(a: Announcement) -> dict:
     return {"id": a.id, "title": a.title, "body": a.body, "created_at": a.created_at.isoformat(),
-            "category": a.category or "General", "pinned": bool(a.pinned), "image_version": a.image_version or 0}
+            "category": a.category or "General", "pinned": bool(a.pinned), "image_version": a.image_version or 0,
+            "publish_at": a.publish_at.isoformat() + "Z" if a.publish_at else None,
+            "scheduled": bool(a.publish_at and a.publish_at > now_naive())}
 
 
 @app.get("/announcements")
@@ -723,6 +755,9 @@ def list_announcements(user: User = Depends(current_user), db: Session = Depends
     e = get_election(db)
     rows = db.scalars(select(Announcement).where(Announcement.election_id == e.id)
                       .order_by(func.coalesce(Announcement.pinned, False).desc(), Announcement.created_at.desc())).all()
+    if user.role != "admin":   # students see a scheduled post only once its time has come
+        now = now_naive()
+        rows = [a for a in rows if not a.publish_at or a.publish_at <= now]
     return [announcement_out(a) for a in rows]
 
 
@@ -730,12 +765,14 @@ def list_announcements(user: User = Depends(current_user), db: Session = Depends
 def create_announcement(body: AnnouncementIn, admin: User = Depends(require_role("admin")),
                         db: Session = Depends(get_db)):
     e = get_election(db)
+    due = now_naive() + timedelta(minutes=body.publish_in_minutes) if body.publish_in_minutes else None
     a = Announcement(election_id=e.id, title=body.title.strip(), body=body.body.strip(), category=_category(body.category),
-                     pinned=body.pinned, image_version=0)
+                     pinned=body.pinned, image_version=0, publish_at=due)
     db.add(a)
     db.commit()
-    audit(db, admin.student_number, "admin", "announcement", a.title)
-    notify("announcements")
+    audit(db, admin.student_number, "admin", "announcement", a.title + (f" (scheduled in {body.publish_in_minutes} min)" if due else ""))
+    if not due:
+        notify("announcements")
     return announcement_out(a)
 
 
@@ -775,7 +812,7 @@ def delete_announcement(announcement_id: int, admin: User = Depends(require_role
 @app.get("/announcements/{announcement_id}/image")
 def get_announcement_image(announcement_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     a = db.get(Announcement, announcement_id)
-    if not a or not a.image:
+    if not a or not a.image or (user.role != "admin" and a.publish_at and a.publish_at > now_naive()):
         raise HTTPException(404, "No image")
     return Response(a.image, media_type=a.image_type or "image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
@@ -828,7 +865,7 @@ def _own_votes(db: Session, e: Election, student_number: str) -> dict[str, Vote]
 def vote_status(student: User = Depends(require_role("student")), db: Session = Depends(get_db)):
     """Which positions this student has voted for and which are still open. Only the student's own choices."""
     e = get_election(db)
-    cands = db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all()
+    cands = ballot_candidates(db, e)
     names = {c.id: c.full_name for c in cands}
     mine = _own_votes(db, e, student.student_number)
     positions = []
@@ -850,7 +887,7 @@ def cast_vote(body: VoteIn, student: User = Depends(require_role("student")), db
     if e.status != "open":
         raise HTTPException(403, f"Voting is not open (status: {e.status})")
     c = db.get(Candidate, body.candidate_id)
-    if not c or c.election_id != e.id:
+    if not c or c.election_id != e.id or not is_published(c):
         raise HTTPException(404, "Candidate not found in this election")
     position = norm_pos(c.position) or "Candidate"
     mine = _own_votes(db, e, student.student_number)
@@ -867,7 +904,7 @@ def cast_vote(body: VoteIn, student: User = Depends(require_role("student")), db
         raise HTTPException(409, f"You have already voted for {position}")
     audit(db, student.student_number, "student", "vote_cast", f"Vote recorded for {position} (choice not logged here)")
     notify("results")
-    all_pos = {pos_key(g[0]) for g in position_groups(db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all())}
+    all_pos = {pos_key(g[0]) for g in position_groups(ballot_candidates(db, e))}
     done = all_pos.issubset(set(mine) | {pos_key(position)})
     return {"message": "Vote recorded", "transaction_id": tx, "position": position, "complete": done}
 
@@ -929,7 +966,7 @@ def results(user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Per position: Hash Map tally, then Quick Sort in descending order of votes. Also returns turnout
     so the app can draw the real-time pie/bar charts. Students receive totals only."""
     e = get_election(db)
-    cands = db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all()
+    cands = ballot_candidates(db, e)
     votes = db.execute(select(Vote.candidate_id, Vote.student_number).where(Vote.election_id == e.id)).all()
     rows = []
     groups = position_groups(cands)
@@ -958,12 +995,21 @@ def results(user: User = Depends(current_user), db: Session = Depends(get_db)):
 _autoclose_task: asyncio.Task | None = None
 
 
+_last_sched_check = [None]
+
+
 def _autoclose_check():
     db = SessionLocal()
     try:
         e = db.scalar(select(Election).order_by(Election.id))
         if e:
             maybe_autoclose(db, e)
+        # a scheduled announcement just became due: tell every phone so it shows up without a manual refresh
+        now = now_naive()
+        prev = _last_sched_check[0] or (now - timedelta(seconds=15))
+        _last_sched_check[0] = now
+        if db.scalar(select(Announcement.id).where(Announcement.publish_at.is_not(None), Announcement.publish_at > prev, Announcement.publish_at <= now)):
+            notify("announcements")
     finally:
         db.close()
 
@@ -1064,8 +1110,10 @@ async def ws_endpoint(ws: WebSocket):
 # ---------------- Admin: candidates ----------------
 def _apply_candidate(c: Candidate, b: CandidateIn):
     for f in ("full_name", "program", "position", "manifesto", "achievements", "leadership", "community",
-              "achievements_score", "leadership_score", "community_score", "video_url", "qa"):
+              "achievements_score", "leadership_score", "community_score", "video_url", "qa", "published"):
         v = getattr(b, f)
+        if f == "published" and v is None:
+            continue
         if f in ("video_url", "qa") and isinstance(v, str):
             v = v.strip() or None
         if f == "position" and isinstance(v, str):
@@ -1299,7 +1347,7 @@ def voter_list(admin: User = Depends(require_role("admin")), db: Session = Depen
     for v in db.scalars(select(Vote).where(Vote.election_id == e.id)):
         voted[v.student_number] = max(voted.get(v.student_number, v.cast_at), v.cast_at)
         count[v.student_number] = count.get(v.student_number, 0) + 1
-    total_pos = len(position_groups(db.scalars(select(Candidate).where(Candidate.election_id == e.id)).all()))
+    total_pos = len(position_groups(ballot_candidates(db, e)))
     rows = db.scalars(select(User).where(User.role == "student").order_by(User.student_number)).all()
     return [{"student_number": u.student_number, "full_name": u.full_name, "program": u.program,
              "respondent_code": u.respondent_code, "has_voted": u.student_number in voted,
@@ -1455,6 +1503,9 @@ def list_proofs(candidate_id: int, user: User = Depends(current_user), db: Sessi
     """Students see the verified documents; the administrator sees all of them (including rejected ones)."""
     q = select(Proof).where(Proof.candidate_id == candidate_id).order_by(Proof.category, Proof.id)
     if user.role != "admin":
+        cand = db.get(Candidate, candidate_id)
+        if not cand or not is_published(cand):
+            return []
         q = q.where(Proof.status == "verified")
     return [_proof_out(p, user.role == "admin") for p in db.scalars(q)]
 
@@ -1677,6 +1728,99 @@ def regenerate_credentials(body: CredentialsIn, admin: User = Depends(require_ro
     db.commit()
     audit(db, admin.student_number, "admin", "credentials_sheet", f"{len(rows)} new passwords generated")
     return {"count": len(rows), "rows": rows}
+
+
+
+# ---------------- Admin: candidate draft/publish, voter profile, one-voter password reset, sessions ----------------
+@app.put("/admin/candidates/{candidate_id}/published")
+def set_published(candidate_id: int, body: PublishedIn, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Draft candidates are hidden from students (list, ballot, results); the administrator still sees them."""
+    c = db.get(Candidate, candidate_id)
+    if not c:
+        raise HTTPException(404, "Candidate not found")
+    if not body.published and db.scalar(select(func.count()).select_from(Vote).where(Vote.candidate_id == c.id)):
+        raise HTTPException(409, "This candidate already has votes, so it cannot be turned back into a draft.")
+    c.published = body.published
+    db.commit()
+    audit(db, admin.student_number, "admin", "candidate_published" if body.published else "candidate_draft", c.full_name)
+    notify("candidates", "results")
+    return candidate_out(c, True)
+
+
+def _student_or_404(db: Session, student_number: str) -> User:
+    u = db.scalar(select(User).where(User.student_number == student_number.strip().upper(), User.role == "student"))
+    if not u:
+        raise HTTPException(404, "Student not found")
+    return u
+
+
+ONLINE_MINUTES = 15
+
+
+def _online(u: User) -> bool:
+    if not u.last_seen:
+        return False
+    if u.tokens_valid_after and u.last_seen <= u.tokens_valid_after:
+        return False
+    return (now_naive() - u.last_seen).total_seconds() <= ONLINE_MINUTES * 60
+
+
+def _iso(d: datetime | None) -> str | None:
+    return d.isoformat() + "Z" if d else None
+
+
+@app.get("/admin/voters/{student_number}/profile")
+def voter_profile(student_number: str, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Quick profile for the Admin > Voters tab: who the student is, whether they are online, and which positions they voted for."""
+    u = _student_or_404(db, student_number)
+    e = get_election(db)
+    names = {c.id: c.full_name for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id))}
+    votes = db.scalars(select(Vote).where(Vote.election_id == e.id, Vote.student_number == u.student_number).order_by(Vote.cast_at)).all()
+    total = len(position_groups(ballot_candidates(db, e)))
+    return {"student_number": u.student_number, "full_name": u.full_name, "program": u.program, "respondent_code": u.respondent_code,
+            "last_login": _iso(u.last_login), "last_seen": _iso(u.last_seen), "online": _online(u),
+            "positions_voted": len(votes), "positions_total": total,
+            "votes": [{"position": v.position or "", "candidate_name": names.get(v.candidate_id, "?"),
+                       "transaction_id": v.transaction_id, "cast_at": _iso(v.cast_at)} for v in votes]}
+
+
+@app.post("/admin/voters/{student_number}/reset-password")
+def reset_one_password(student_number: str, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Creates a new random password for ONE student and ends that student's open sessions. The plain text is returned once
+    (only the bcrypt hash is stored)."""
+    u = _student_or_404(db, student_number)
+    pw = secrets.token_urlsafe(6)
+    u.password_hash = hash_password(pw, rounds=10)
+    u.tokens_valid_after = now_naive()
+    u.otp_pending = False
+    clear_fails(u.student_number)
+    db.commit()
+    audit(db, admin.student_number, "admin", "password_reset", u.student_number)
+    return {"student_number": u.student_number, "full_name": u.full_name, "password": pw}
+
+
+@app.get("/admin/sessions")
+def active_sessions(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Accounts seen in the last 15 minutes (newest first)."""
+    since = now_naive() - timedelta(minutes=ONLINE_MINUTES)
+    rows = [u for u in db.scalars(select(User).where(User.last_seen.is_not(None), User.last_seen >= since).order_by(User.last_seen.desc())) if _online(u)]
+    return {"minutes": ONLINE_MINUTES, "sessions": [{"student_number": u.student_number, "full_name": u.full_name, "role": u.role, "program": u.program,
+                                                       "last_login": _iso(u.last_login), "last_seen": _iso(u.last_seen)} for u in rows]}
+
+
+@app.post("/admin/sessions/{student_number}/end")
+def end_session(student_number: str, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Signs the account out everywhere: its tokens stop working at the next request."""
+    u = db.scalar(select(User).where(User.student_number == student_number.strip().upper()))
+    if not u:
+        raise HTTPException(404, "Account not found")
+    if u.id == admin.id:
+        raise HTTPException(400, "You cannot end your own session here. Use Log out.")
+    u.tokens_valid_after = now_naive()
+    u.otp_pending = False
+    db.commit()
+    audit(db, admin.student_number, "admin", "session_ended", u.student_number)
+    return {"ended": u.student_number}
 
 
 # ---------------- Admin: audit log ----------------
