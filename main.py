@@ -1072,15 +1072,23 @@ SAMPLE_CANDIDATES = [
 ]
 
 
-def _add_sample_candidates(db: Session, e: Election) -> int:
+def _add_sample_candidates(db: Session, e: Election, names_only: bool = False) -> int:
     """Adds the fictional candidates that are not on the ballot yet (matched by name and position). Returns how many were added."""
-    have = {(c.full_name, pos_key(c.position or "")) for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id))}
+    existing = {(c.full_name, pos_key(c.position or "")): c for c in db.scalars(select(Candidate).where(Candidate.election_id == e.id))}
     added = 0
     for pos, name, prog, man, ach, lead, comm, (sa, sl, sc) in SAMPLE_CANDIDATES:
-        if (name, pos_key(pos)) in have:
+        old = existing.get((name, pos_key(pos)))
+        if old is not None:
+            if not names_only and not (old.manifesto or "").strip():   # a name added without its description: fill it in
+                old.manifesto, old.achievements, old.leadership, old.community = man, ach, lead, comm
+                old.achievements_score, old.leadership_score, old.community_score = sa, sl, sc
+                added += 1
             continue
-        db.add(Candidate(election_id=e.id, full_name=name, program=prog, position=pos, manifesto=man, achievements=ach, leadership=lead,
-                         community=comm, achievements_score=sa, leadership_score=sl, community_score=sc))
+        if names_only:   # name, program and position only; the description and scores are left blank for the administrator
+            db.add(Candidate(election_id=e.id, full_name=name, program=prog, position=pos, manifesto="", achievements="", leadership="", community=""))
+        else:
+            db.add(Candidate(election_id=e.id, full_name=name, program=prog, position=pos, manifesto=man, achievements=ach, leadership=lead,
+                             community=comm, achievements_score=sa, leadership_score=sl, community_score=sc))
         added += 1
     db.commit()
     if added:
@@ -1106,12 +1114,12 @@ def ensure_sample_candidates(db: Session) -> int:
 
 
 @app.post("/admin/demo/candidates")
-def demo_candidates(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+def demo_candidates(names_only: bool = False, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
     """Adds the fictional candidates that are missing (all 12 positions). Safe to repeat. Not allowed after votes are cast."""
     e = get_election(db)
     if db.scalar(select(func.count()).select_from(Vote).where(Vote.election_id == e.id)):
         raise HTTPException(409, "Votes have already been cast. Reset the election before adding sample candidates.")
-    added = _add_sample_candidates(db, e)
+    added = _add_sample_candidates(db, e, names_only)
     if added:
         audit(db, admin.student_number, "admin", "demo_candidates", f"{added} sample candidates added")
         notify("candidates", "results")
