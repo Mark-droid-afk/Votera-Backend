@@ -1370,6 +1370,54 @@ def turnout_by_program(admin: User = Depends(require_role("admin")), db: Session
     return out
 
 
+@app.get("/admin/quota")
+def pilot_quota(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Pilot tracker: Table 1 target respondents per program against how many accounts have finished the ballot
+    (voted for every position) and how many have started."""
+    e = get_election(db)
+    total_pos = len(position_groups(ballot_candidates(db, e)))
+    cnt: dict[str, int] = {}
+    for sn, n in db.execute(select(Vote.student_number, func.count()).where(Vote.election_id == e.id).group_by(Vote.student_number)):
+        cnt[sn] = n
+    started: dict[str, int] = {}
+    finished: dict[str, int] = {}
+    for u in db.scalars(select(User).where(User.role == "student")):
+        n = cnt.get(u.student_number, 0)
+        if n > 0:
+            started[u.program] = started.get(u.program, 0) + 1
+        if total_pos > 0 and n >= total_pos:
+            finished[u.program] = finished.get(u.program, 0) + 1
+    rows = []
+    for p, t in zip(PROGRAMS, TABLE1_ALLOCATION):
+        f = finished.get(p, 0)
+        rows.append({"program": p, "target": t, "started": started.get(p, 0), "finished": f, "remaining": max(t - f, 0)})
+    return {"positions": total_pos, "target_total": sum(TABLE1_ALLOCATION),
+            "finished_total": sum(r["finished"] for r in rows), "started_total": sum(r["started"] for r in rows),
+            "rows": rows}
+
+
+@app.get("/admin/candidates/{candidate_id}/similarity")
+def similarity_detail(candidate_id: int, admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    """Why a manifesto got its similarity: the most similar other manifesto and the distinctive words they share.
+    Uses the same TF-IDF vectors as the originality score. Read-only."""
+    e = get_election(db)
+    cands = db.scalars(select(Candidate).where(Candidate.election_id == e.id).order_by(Candidate.id)).all()
+    idx = next((i for i, c in enumerate(cands) if c.id == candidate_id), None)
+    if idx is None:
+        raise HTTPException(404, "Candidate not found")
+    sims = scoring.compute_similarities_detailed([c.manifesto for c in cands])
+    s, j = sims[idx]
+    me = cands[idx]
+    out = {"similarity": round(s, 4), "flagged": scoring.is_flagged(s), "threshold": scoring.FLAG_THRESHOLD,
+           "candidate": {"id": me.id, "full_name": me.full_name, "position": me.position, "manifesto": me.manifesto},
+           "other": None, "shared_terms": []}
+    if j is not None:
+        o = cands[j]
+        out["other"] = {"id": o.id, "full_name": o.full_name, "position": o.position, "manifesto": o.manifesto}
+        out["shared_terms"] = [{"term": w, "weight": x} for w, x in scoring.shared_terms(me.manifesto, o.manifesto, [c.manifesto for c in cands])]
+    return out
+
+
 @app.get("/admin/export/votes.csv")
 def export_votes(admin: User = Depends(require_role("admin")), db: Session = Depends(get_db)):
     buf = io.StringIO()
@@ -1918,9 +1966,9 @@ def selftest(admin: User = Depends(require_role("admin")), db: Session = Depends
     def t_dupes():
         e = get_election(db)
         n_dupe = db.scalar(select(func.count()).select_from(
-            select(Vote.student_number).where(Vote.election_id == e.id).group_by(Vote.student_number)
+            select(Vote.student_number).where(Vote.election_id == e.id).group_by(Vote.student_number, Vote.position)
             .having(func.count() > 1).subquery()))
-        return n_dupe == 0, f"{n_dupe} students with more than one vote in the real data"
+        return n_dupe == 0, f"{n_dupe} student-and-position pairs with more than one vote in the real data"
     check("Voting", "No duplicate votes in the real data", t_dupes)
 
     # Tally and sorting
@@ -1958,6 +2006,17 @@ def selftest(admin: User = Depends(require_role("admin")), db: Session = Depends
     check("Credibility", "Weighted Sum Model (35/30/20/15)",
           lambda: (scoring.credibility_score(80, 70, 60, 50) == 68.5 and abs(sum(scoring.WEIGHTS.values()) - 1) < 1e-9,
                    "80, 70, 60, 50 gives 68.5 and the weights add up to 100%"))
+
+    def t_stable():
+        real = [c.manifesto for c in db.scalars(select(Candidate).where(Candidate.election_id == get_election(db).id).order_by(Candidate.id))]
+        sample = real if len(real) >= 2 else ["improve student services and campus events", "build a recycling program for dormitories",
+                                              "improve student services and campus events for everyone"]
+        a = scoring.compute_similarities_detailed(sample)
+        b = scoring.compute_similarities_detailed(sample)
+        same = a == b and [scoring.credibility_score(scoring.originality_score(x[0]), 80, 70, 60) for x in a] == \
+            [scoring.credibility_score(scoring.originality_score(x[0]), 80, 70, 60) for x in b]
+        return same, f"Scores for {len(sample)} manifestos were calculated twice and came out identical"
+    check("Credibility", "Scores are consistent when recalculated", t_stable)
 
     passed = sum(1 for c in checks if c["ok"])
     audit(db, admin.student_number, "admin", "selftest", f"{passed}/{len(checks)} checks passed", ok=passed == len(checks))

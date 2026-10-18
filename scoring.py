@@ -50,6 +50,21 @@ def compute_similarities_detailed(manifestos: list[str]) -> list[tuple[float, in
     return out
 
 
+def shared_terms(a: str, b: str, manifestos: list[str], limit: int = 8) -> list[tuple[str, float]]:
+    """Distinctive words that two manifestos have in common, strongest first. The TF-IDF vectors are built over the
+    whole set (`manifestos`), so the weights are the same ones used for the similarity score. Each word's share of the
+    cosine similarity is its weight in A times its weight in B (vectors are length-normalised)."""
+    try:
+        vec = TfidfVectorizer(lowercase=True, stop_words="english").fit(manifestos)
+        m = vec.transform([a, b]).toarray()
+    except ValueError:
+        return []
+    names = vec.get_feature_names_out()
+    both = [(str(names[k]), float(m[0][k] * m[1][k])) for k in range(len(names)) if m[0][k] > 0 and m[1][k] > 0]
+    both.sort(key=lambda t: -t[1])
+    return [(w, round(x, 4)) for w, x in both[:limit]]
+
+
 def originality_score(highest_similarity: float) -> float:
     """Originality = 100 - (highest cosine similarity x 100)."""
     return round(100 - highest_similarity * 100, 2)
