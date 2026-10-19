@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response
 from fastapi.middleware.gzip import GZipMiddleware
@@ -599,6 +600,9 @@ def _candidate_base(c: Candidate) -> dict:
 # ---------------- Application layer ----------------
 app = FastAPI(title="Votera API (prototype)")
 app.add_middleware(GZipMiddleware, minimum_size=600)  # smaller responses over mobile data (candidate texts, voter lists)
+# The browser version of the app (a static page on GitHub Pages) calls this server from another address, so the browser needs
+# permission. No cookies are used: every request carries its own bearer token, so any origin may be allowed safely.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"], expose_headers=["Content-Disposition"])
 
 
 @app.post("/auth/login")
